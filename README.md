@@ -252,8 +252,7 @@ Expected output:
 ```
 AstraDB 0.1.0
 configuration: data_dir=data log_level=INFO page_size=16384
-No SQL, query engine or server yet; the Disk Manager is the whole of the
-storage engine so far.
+Disk Manager available; no SQL, query engine or server yet.
 2026-09-30T19:35:47.674Z INFO  [main] main.c:48: AstraDB 0.1.0 ready
 ```
 

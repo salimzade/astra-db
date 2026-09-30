@@ -34,7 +34,7 @@ int main(void)
 
     printf("%s %s\n", ASTRA_DB_NAME, astra_version());
     printf("configuration: %s\n", summary);
-    printf("Skeleton build: no storage engine, query engine or server yet.\n");
+    printf("Disk Manager available; no SQL, query engine or server yet.\n");
 
     /*
      * Flush stdout before logging. The log goes to stderr, which is unbuffered,
