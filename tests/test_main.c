@@ -157,6 +157,21 @@ static const astra_test_entry k_tests[] = {
     { "config_validate",    astra_test_config_validate },
     { "config_copy_and_describe", astra_test_config_copy_and_describe },
 
+    { "disk_format",        astra_test_disk_format },
+    { "disk_page_offsets",  astra_test_disk_page_offsets },
+    { "disk_page_lifecycle", astra_test_disk_page_lifecycle },
+    { "disk_create",        astra_test_disk_create },
+    { "disk_open",          astra_test_disk_open },
+    { "disk_roundtrip",     astra_test_disk_roundtrip },
+    { "disk_alloc_many",    astra_test_disk_alloc_many },
+    { "disk_sync",          astra_test_disk_sync },
+    { "disk_truncate",      astra_test_disk_truncate },
+    { "disk_invalid_page",  astra_test_disk_invalid_page },
+    { "disk_invalid_path",  astra_test_disk_invalid_path },
+    { "disk_corruption",    astra_test_disk_corruption },
+    { "disk_page_sizes",    astra_test_disk_page_sizes },
+    { "disk_stress",        astra_test_disk_stress },
+
     { "lifecycle",     astra_test_lifecycle }
 };
 

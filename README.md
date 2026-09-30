@@ -8,12 +8,14 @@ SQL-like language.
 **This repository is at the very beginning of the project.** It currently
 contains the build system, the public API skeleton and the low-level core
 infrastructure that every later subsystem will sit on: a structured error type,
-an allocation abstraction, logging, basic types and process configuration. No
-storage, SQL, transactions, WAL, indexing or networking exists yet.
+an allocation abstraction, logging, basic types and process configuration. On
+top of that sits the first piece of real storage, the Disk Manager, which maps
+fixed-size pages onto `<data_dir>/main.db`. No SQL, transactions, WAL, indexing
+or networking exists yet.
 
 ## Current status
 
-Milestone 1 - core infrastructure.
+Milestone 2 - disk manager.
 
 | Area | State |
 | --- | --- |
@@ -26,9 +28,10 @@ Milestone 1 - core infrastructure.
 | Logging (6 levels, timestamps, subsystems, configurable threshold) | done |
 | Basic types (`uint8`-`int64`, `page_id_t`, `txn_id_t`, `lsn_t`) | done |
 | Process configuration (`astra_config`) | done |
-| Unit tests + CTest integration | 25 groups, 672 checks |
+| Disk Manager (pages, header, checksum, sync, truncate) | done |
+| Unit tests + CTest integration | 39 groups, 11513 checks |
 | Ownership documentation | [`docs/ownership.md`](docs/ownership.md) |
-| Storage engine, SQL, transactions, WAL, indexes | not started |
+| Buffer manager, SQL, transactions, WAL, indexes | not started |
 
 Layout:
 
@@ -39,23 +42,34 @@ astra-db/
 ├── include/astra/          public API headers
 │   ├── astra.h               umbrella header
 │   ├── version.h             single source of truth for the version
-│   └── core/                 public core module headers
-│       ├── allocator.h         every heap allocation goes through this
-│       ├── config.h            process configuration value type
-│       ├── error.h             status codes, categories, astra_error
-│       ├── log.h               logging
-│       └── types.h             fixed width aliases, page_id_t, txn_id_t, lsn_t
+│   ├── core/                 public core module headers
+│   │   ├── allocator.h         every heap allocation goes through this
+│   │   ├── config.h            process configuration value type
+│   │   ├── error.h             status codes, categories, astra_error
+│   │   ├── log.h               logging
+│   │   └── types.h             fixed width aliases, page_id_t, txn_id_t, lsn_t
+│   └── storage/             public storage module headers
+│       ├── format.h            on-disk layout, offsets, checksum span
+│       ├── page.h              page buffer lifecycle
+│       └── disk_manager.h      the Disk Manager itself
 ├── src/
 │   ├── main.c              CLI entry point
-│   └── core/               library internals
-│       ├── astra_core.c       library lifecycle
-│       ├── allocator.c        the heap
-│       ├── config.c           configuration validation
-│       ├── error.c            error tables and astra_error
-│       ├── log.c              logging
-│       ├── types.c            identifier predicates
-│       ├── astra_internal.h   private: shared internal helpers
-│       └── log_internal.h     private: log sink seam, used by tests
+│   ├── core/               library internals
+│   │   ├── astra_core.c       library lifecycle
+│   │   ├── allocator.c        the heap
+│   │   ├── config.c           configuration validation
+│   │   ├── error.c            error tables and astra_error
+│   │   ├── log.c              logging
+│   │   ├── types.c            identifier predicates
+│   │   ├── astra_internal.h   private: shared internal helpers
+│   │   └── log_internal.h     private: log sink seam, used by tests
+│   └── storage/            storage internals
+│       ├── database_file.c    the file, its header, its corruption checks
+│       ├── page_io.c          page buffer validation and lifecycle
+│       ├── disk_manager.c     the public entry points
+│       ├── storage_internal.h private: byte order, CRC-32, paths, directories
+│       ├── database_file.h    private: file handle abstraction
+│       └── page_io.h          private: page helpers
 ├── tests/                  unit tests, one file per module
 ├── docs/                   ownership rules
 ├── benchmarks/             reserved, empty
@@ -123,8 +137,9 @@ queue and no background thread yet.
 compile time. `page_id_t`, `txn_id_t` and `lsn_t` are all 64 bits and
 documented, with `ASTRA_*_INVALID` sentinels.
 
-They deliberately carry no database semantics yet. No allocation policy, no
-ordering guarantee, no persistence format.
+They deliberately carry no database semantics beyond the shapes a database
+needs. The allocation policy for a `page_id_t` belongs to the Disk Manager,
+which is where it now lives.
 
 ### Configuration
 
@@ -133,6 +148,77 @@ with documented defaults. Every setter validates before it mutates, so a
 rejected setting leaves the configuration untouched. There is no configuration
 file format yet; adding one later means adding a function that fills this
 struct.
+
+The default page size is 16 KiB. It is a default rather than a constant: any
+power of two from 512 bytes to 1 MiB is accepted, and the value is recorded in
+the database header, so a database is always read back at the stride it was
+written at.
+
+## The storage module
+
+### Disk Manager
+
+The Disk Manager is the only thing in the library that touches a file. It maps
+fixed-size pages onto `<data_dir>/main.db` and does four jobs: create, read,
+write, and extend.
+
+```c
+astra_config config;
+
+astra_config_init(&config);
+astra_config_set_data_dir(&config, "data");
+
+astra_disk_manager *db = NULL;
+
+if (astra_disk_manager_create(&config, &db) != ASTRA_OK) {
+    /* the directory already holds a database, or the I/O failed */
+}
+```
+
+A database is one flat array of pages. Page `N` lives at byte offset
+`N * page_size`, so a read is a seek and a read and a write is a seek and a
+write. Page 0 is a header that the library owns; the first page a caller is
+given is page 1.
+
+Four decisions are worth stating outright, because they are what the rest of
+the system will rely on:
+
+* **Page count is derived, not stored.** It is the length of the file divided by
+  the page size, so it cannot disagree with itself.
+* **A header is verified before it is trusted.** Magic, version, page size and a
+  CRC-32 over the header prefix. A file that is not a readable AstraDB file for
+  the page size the caller asked for is refused with `ASTRA_ERR_CORRUPTION`
+  rather than read.
+* **Durability is explicit.** Writes are not synced. `astra_disk_manager_sync`
+  is the only thing that makes them durable, and `astra_disk_manager_close`
+  syncs first and reports a failure to sync. The one exception is create, which
+  syncs its header before reporting success: a database that cannot be opened
+  again is not a database.
+* **Identifiers are never reused.** Truncating to a smaller page count
+  permanently retires the identifiers above it, because a later subsystem may
+  already have put them somewhere a reader will find.
+
+```c
+page_id_t id;
+astra_page page = ASTRA_PAGE_INIT;
+
+astra_disk_manager_alloc_page(db, &id);      /* first call returns page 1 */
+astra_page_init(&page, 16384);
+page.page_id = id;
+memcpy(page.data, record, sizeof record);
+page.is_dirty = true;
+
+astra_disk_manager_write_page(db, &page);    /* not yet durable */
+astra_page_release(&page);
+```
+
+This is **not** a buffer manager. Every read and write is a system call against
+the file, and the page buffer is owned by the caller and only as long as it wants
+it. Caching, pinning, a clock hand and eviction policy are the next layer, and
+they are the reason the Disk Manager was built to be correct without them.
+
+Page 0 can be read but never written, so nothing above this layer can corrupt
+the header by accident.
 
 ## Build instructions
 
@@ -165,8 +251,9 @@ Expected output:
 
 ```
 AstraDB 0.1.0
-configuration: data_dir=data log_level=INFO page_size=4096
-Skeleton build: no storage engine, query engine or server yet.
+configuration: data_dir=data log_level=INFO page_size=16384
+No SQL, query engine or server yet; the Disk Manager is the whole of the
+storage engine so far.
 2026-09-30T19:35:47.674Z INFO  [main] main.c:48: AstraDB 0.1.0 ready
 ```
 
@@ -263,21 +350,22 @@ its own.
    *(done)*
 2. **Memory and error foundation** - errors, allocator, logging, basic types,
    configuration. *(done)*
-3. **Page and file layer** - page abstraction, buffered file I/O, checksums.
-   *(next)*
-4. **WAL** - write-ahead log, log records, flush and recovery protocol.
-5. **Storage engine** - heap tables, tuples, free space management, crash
+3. **Page and file layer** - page abstraction, disk manager, file header,
+   checksums. *(done: the Disk Manager, with no buffering)*
+4. **Buffer manager** - page cache, pinning, replacement, dirty page flushing.
+5. **WAL** - write-ahead log, log records, flush and recovery protocol.
+6. **Storage engine** - heap tables, tuples, free space management, crash
    recovery driven by the WAL.
-6. **Transactions and MVCC** - transaction identifiers, visibility rules,
+7. **Transactions and MVCC** - transaction identifiers, visibility rules,
    snapshot reads.
-7. **B+Tree indexes** - node layout, page splits and merges, cursors.
-8. **SQL front end** - parser and a clean SQL-like language.
-9. **Query planner and optimizer** - rule based, then cost based.
-10. **Advanced SQL** - views, stored procedures, functions, triggers.
-11. **JSON and full-text search.**
-12. **Partitioning, replication, sharding.**
-13. **Security** - authentication, authorization, auditing, encryption.
-14. **Operations** - backup and restore.
+8. **B+Tree indexes** - node layout, page splits and merges, cursors.
+9. **SQL front end** - parser and a clean SQL-like language.
+10. **Query planner and optimizer** - rule based, then cost based.
+11. **Advanced SQL** - views, stored procedures, functions, triggers.
+12. **JSON and full-text search.**
+13. **Partitioning, replication, sharding.**
+14. **Security** - authentication, authorization, auditing, encryption.
+15. **Operations** - backup and restore.
 
 ## License
 

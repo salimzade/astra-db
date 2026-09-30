@@ -72,7 +72,7 @@ typedef struct astra_config {
  *
  * Defaults: data_dir = ASTRA_CONFIG_DEFAULT_DATA_DIR ("data"),
  * log_level = ASTRA_CONFIG_DEFAULT_LOG_LEVEL (ASTRA_LOG_INFO),
- * page_size = ASTRA_PAGE_SIZE_DEFAULT (4096).
+ * page_size = ASTRA_PAGE_SIZE_DEFAULT (16384).
  *
  * Parameters:
  *   cfg - destination. Must not be NULL.

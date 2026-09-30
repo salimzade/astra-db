@@ -14,7 +14,7 @@ void astra_test_config_defaults(void)
     ASTRA_CHECK_STRING(config.data_dir, "data");
     ASTRA_CHECK(config.log_level == ASTRA_LOG_INFO);
     ASTRA_CHECK(config.log_level == ASTRA_CONFIG_DEFAULT_LOG_LEVEL);
-    ASTRA_CHECK(config.page_size == 4096u);
+    ASTRA_CHECK(config.page_size == 16384u);
     ASTRA_CHECK(config.page_size == ASTRA_PAGE_SIZE_DEFAULT);
 
     /* The defaults must satisfy the validation the configuration promises. */
@@ -26,10 +26,10 @@ void astra_test_config_defaults(void)
 
     /* Init is idempotent, so re-initialising a used struct restores the
      * defaults rather than merging into whatever was there. */
-    ASTRA_CHECK_STATUS(astra_config_set_page_size(&config, 16384u), ASTRA_OK);
+    ASTRA_CHECK_STATUS(astra_config_set_page_size(&config, 4096u), ASTRA_OK);
     ASTRA_CHECK_STATUS(astra_config_set_log_level(&config, ASTRA_LOG_FATAL), ASTRA_OK);
     ASTRA_CHECK_STATUS(astra_config_init(&config), ASTRA_OK);
-    ASTRA_CHECK(config.page_size == 4096u);
+    ASTRA_CHECK(config.page_size == 16384u);
     ASTRA_CHECK(config.log_level == ASTRA_LOG_INFO);
 
     /* A NULL destination is reported, not dereferenced. */
@@ -181,13 +181,13 @@ void astra_test_config_copy_and_describe(void)
     ASTRA_CHECK_STATUS(astra_config_init(&source), ASTRA_OK);
     ASTRA_CHECK_STATUS(astra_config_set_data_dir(&source, "/srv/astra"), ASTRA_OK);
     ASTRA_CHECK_STATUS(astra_config_set_log_level(&source, ASTRA_LOG_DEBUG), ASTRA_OK);
-    ASTRA_CHECK_STATUS(astra_config_set_page_size(&source, 16384u), ASTRA_OK);
+    ASTRA_CHECK_STATUS(astra_config_set_page_size(&source, 32768u), ASTRA_OK);
 
     /* A copy is fully independent of its source. */
     ASTRA_CHECK_STATUS(astra_config_copy(&destination, &source), ASTRA_OK);
     ASTRA_CHECK_STRING(destination.data_dir, "/srv/astra");
     ASTRA_CHECK(destination.log_level == ASTRA_LOG_DEBUG);
-    ASTRA_CHECK(destination.page_size == 16384u);
+    ASTRA_CHECK(destination.page_size == 32768u);
 
     ASTRA_CHECK_STATUS(astra_config_set_data_dir(&source, "/elsewhere"), ASTRA_OK);
     ASTRA_CHECK_STRING(destination.data_dir, "/srv/astra");
@@ -206,7 +206,7 @@ void astra_test_config_copy_and_describe(void)
     ASTRA_CHECK((size_t)needed < sizeof buffer);
     ASTRA_CHECK(strstr(buffer, "data_dir=/elsewhere") != NULL);
     ASTRA_CHECK(strstr(buffer, "log_level=DEBUG") != NULL);
-    ASTRA_CHECK(strstr(buffer, "page_size=16384") != NULL);
+    ASTRA_CHECK(strstr(buffer, "page_size=32768") != NULL);
     ASTRA_CHECK(strchr(buffer, '\n') == NULL);
 
     /* Truncation follows snprintf semantics and stays NUL terminated. */

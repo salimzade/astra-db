@@ -135,4 +135,20 @@ void astra_test_config_setters(void);
 void astra_test_config_validate(void);
 void astra_test_config_copy_and_describe(void);
 
+/* src/storage/, through the public Disk Manager API and two private headers. */
+void astra_test_disk_format(void);
+void astra_test_disk_page_offsets(void);
+void astra_test_disk_page_lifecycle(void);
+void astra_test_disk_create(void);
+void astra_test_disk_open(void);
+void astra_test_disk_roundtrip(void);
+void astra_test_disk_alloc_many(void);
+void astra_test_disk_sync(void);
+void astra_test_disk_truncate(void);
+void astra_test_disk_invalid_page(void);
+void astra_test_disk_invalid_path(void);
+void astra_test_disk_corruption(void);
+void astra_test_disk_page_sizes(void);
+void astra_test_disk_stress(void);
+
 #endif /* ASTRA_TESTS_TEST_SUPPORT_H */

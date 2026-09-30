@@ -5,13 +5,17 @@ add_executable(astra_tests
     test_allocator.c
     test_log.c
     test_config.c
+    test_disk_manager.c
 )
 
 target_link_libraries(astra_tests PRIVATE astradb)
 
-# The tests link the static library directly and additionally include one private
-# header, src/core/log_internal.h, which redirects the log sink so that output
-# can be asserted on. Nothing else in src/ is reachable this way.
+# The tests link the static library directly and additionally include private
+# headers that are not part of the public API: src/core/log_internal.h, which
+# redirects the log sink so that output can be asserted on, and
+# src/storage/storage_internal.h and src/storage/database_file.h, which expose the
+# byte order primitives and the page arithmetic that the format tests assert
+# directly. Nothing else in src/ is reachable this way.
 target_include_directories(astra_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 
 set_target_properties(astra_tests PROPERTIES

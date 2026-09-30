@@ -18,6 +18,9 @@
  *   astra/core/allocator.h  the heap; every allocation goes through it
  *   astra/core/log.h        logging
  *   astra/core/config.h     process configuration
+ *   astra/storage/disk_manager.h  page_id_t to bytes on a disk and back
+ *   astra/storage/page.h          the in-memory page buffer
+ *   astra/storage/format.h        the on-disk layout of the primary data file
  *
  * See docs/ownership.md for the rules those headers share.
  */
@@ -27,6 +30,9 @@
 #include "astra/core/error.h"
 #include "astra/core/log.h"
 #include "astra/core/types.h"
+#include "astra/storage/disk_manager.h"
+#include "astra/storage/format.h"
+#include "astra/storage/page.h"
 #include "astra/version.h"
 
 #ifdef __cplusplus

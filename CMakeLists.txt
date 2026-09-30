@@ -77,6 +77,9 @@ add_library(astradb STATIC
     src/core/error.c
     src/core/log.c
     src/core/types.c
+    src/storage/database_file.c
+    src/storage/disk_manager.c
+    src/storage/page_io.c
 )
 add_library(astra::core ALIAS astradb)
 

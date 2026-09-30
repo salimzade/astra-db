@@ -130,9 +130,39 @@ NULL with the original block still owned by the caller and still valid. An
 
 ### 11. Resources that persist are explicit about their lifetime
 
-Nothing in AstraDB owns a file handle, a lock or a thread at this phase. When
-something does, its constructor takes an owner and its destructor names what it
-releases. An object with no documented destructor is not finished.
+A thing that owns an operating system resource has exactly one owner, names it,
+and releases it in one place. The Disk Manager is the first such object:
+
+| Resource | Owned by | Acquired | Released |
+| --- | --- | --- | --- |
+| The open file handle on `main.db` | One `astra_disk_manager` | `astra_disk_manager_create` / `_open` | `astra_disk_manager_close` |
+| A copy of the resolved path | One `astra_disk_manager` | with the handle | `astra_disk_manager_close` |
+| The one-page header buffer | The library, briefly | `astra_file_create` / `_open` | before those return |
+
+The rules that follow from that:
+
+* **A manager is single owner of its file.** Two managers may not name the same
+  database, and the library does not coordinate them if a caller opens one twice
+  on purpose. One handle, one owner, no sharing, no reference counting.
+* **A manager is not thread safe.** It holds one file position and one cached
+  page count. The buffer manager that will sit on top of this is the thing that
+  will serialise access; until it exists, a manager is used by one thread.
+* **`astra_disk_manager_close` is the only release.** There is no
+  `astra_disk_manager_free`. Closing syncs first and reports a failure to sync,
+  so a manager that could not be persisted is not silently forgotten.
+* **A manager that was not created does not exist.** Every entry point writes
+  `*out_manager` before it can fail, so a failed `create` or `open` leaves NULL
+  rather than a half-built object to clean up. There is no partially constructed
+  manager to leak.
+* **`astra_disk_manager_create` may create the data directory.** The directory is
+  created one level deep and owned by the file system, not by the library: the
+  library removes nothing on close, including the file it just made if the write
+  of the header failed. A failed create removes its own half-built file, because a
+  file that can never be opened is not a database, but it leaves the directory.
+
+Nothing in AstraDB owns a lock or a thread at this phase. When something does,
+its constructor takes an owner and its destructor names what it releases. An
+object with no documented destructor is not finished.
 
 ### 12. Process-global state is enumerated and justified
 
@@ -149,6 +179,59 @@ definition:
 The last two are deliberate, documented exceptions to the project's "no hidden
 global mutable state" principle. If you add a fifth, expect to justify it in the
 same place.
+
+## Ownership in the storage module
+
+`astra_page` is a value with a heap buffer inside it, and it is the one public
+struct in AstraDB that owns memory.
+
+```c
+/* The page owns `data`; the Disk Manager never keeps a pointer to either. */
+astra_page page = ASTRA_PAGE_INIT;
+
+if (astra_page_init(&page, 16384) != ASTRA_OK) {
+    return ASTRA_ERR_OUT_OF_MEMORY;
+}
+page.page_id = id;
+memcpy(page.data, record, sizeof record);
+page.is_dirty = true;
+
+if (astra_disk_manager_write_page(db, &page) != ASTRA_OK) {
+    /* `page.data` is still the caller's to release. */
+}
+astra_page_release(&page);          /* now the page owns nothing */
+```
+
+- **The caller owns a page, and only the caller releases it.** Neither
+  `astra_disk_manager_read_page` nor `astra_disk_manager_write_page` retains the
+  page, and neither allocates. A caller may reuse one page buffer across every
+  read and write, which is the point: the buffer manager will hold many at once.
+- **`astra_page_release` is idempotent and NULL tolerant.** It resets the struct
+  to `ASTRA_PAGE_INIT`, so the same page can be released by a cleanup path and
+  again by the code that created it without a leak or a double free.
+- **Re-initialising a live page leaks.** `astra_page_init` overwrites the struct
+  without looking at it. Release first.
+- **`is_dirty` belongs to the caller.** The Disk Manager clears it after a
+  successful write and never sets it. It is a hint, not a contract, and no
+  subsystem consults it yet.
+- **`ASTRA_PAGE_INIT` is the only way to declare a page.** It is a brace
+  initialiser, so it works as a file-scope object, a local, or a member, and it
+  cannot drift out of step with the struct.
+
+The file's own header is the one buffer the caller never sees. It is allocated,
+filled, verified and released inside `database_file.c`, and a manager exposes it
+only as a readable, non-writable page 0. Nothing above this layer can corrupt it
+by writing to it, and every open re-verifies it before any other page is touched.
+
+Two ownership rules that come from identifiers rather than memory:
+
+- **A page identifier is owned by the file, not by the caller.** The Disk Manager
+  allocates it and the caller uses it; no caller frees it and no caller recycles
+  one.
+- **Truncation retires identifiers permanently.** Shrinking a database does not
+  make the identifiers above the new end available again. The memory behind them
+  may already be recorded somewhere a reader will find it, so reuse would be a
+  correctness bug rather than an optimisation.
 
 ## Working memory ownership, by example
 
@@ -190,6 +273,8 @@ Adding a public function? Confirm each of these before it merges:
 - [ ] Is every return value checked by the caller, or explicitly discarded with `(void)`?
 - [ ] Does it allocate through `astra_*` only?
 - [ ] Does it leave the caller's objects unmodified on failure?
+- [ ] If it owns an operating system resource, is there exactly one place that releases it?
+- [ ] If it takes ownership of something, does the header say so in the word "Ownership"?
 
 ## See also
 
@@ -197,5 +282,8 @@ Adding a public function? Confirm each of these before it merges:
 * `include/astra/core/error.h` - the error type, and why it does not allocate
 * `include/astra/core/config.h` - the configuration value type
 * `include/astra/core/log.h` - logging, and the borrowed-string contract
+* `include/astra/storage/format.h` - the on-disk layout, and why it is checksummed
+* `include/astra/storage/page.h` - the page value, and who releases its buffer
+* `include/astra/storage/disk_manager.h` - the manager, and when it syncs
 * `src/core/log_internal.h` - the private log sink seam used by the tests
 * `README.md` - the development principles these rules implement

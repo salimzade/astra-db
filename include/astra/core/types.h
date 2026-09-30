@@ -156,7 +156,7 @@ ASTRA_STATIC_ASSERT(sizeof(lsn_t) == sizeof(uint64), "lsn_t must be 64 bits");
 #define ASTRA_PAGE_SIZE_MAX ((uint32)65536)
 
 /** Page size used when no page size is configured explicitly. */
-#define ASTRA_PAGE_SIZE_DEFAULT ((uint32)4096)
+#define ASTRA_PAGE_SIZE_DEFAULT ((uint32)16384)
 
 /*
  * ---------------------------------------------------------------------------
