@@ -1,0 +1,45 @@
+# Build output
+build/
+build-*/
+out/
+cmake-build-*/
+install/
+_deps/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+install_manifest.txt
+*.cmake.stamp
+
+# Compiled objects, libraries and binaries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.dSYM/
+
+# Coverage
+*.gcda
+*.gcno
+*.gcov
+coverage/
+
+# Editors and IDEs
+.vscode/
+.idea/
+.cache/
+.clangd/
+*.swp
+*~
