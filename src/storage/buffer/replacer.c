@@ -32,18 +32,28 @@
  *     unreferenced frame within the first frame or two they look at.
  *   - O(n) worst case for a single call, and bounded at two sweeps. See below.
  *
- * The never-select-a-pinned-page rule
- * -----------------------------------
- * A pinned frame is skipped and its reference bit is *left alone*. That is deliberate,
- * and it is the one place where a naive clock goes subtly wrong: a page that was pinned
- * across a long sweep is not "recently used", it is *busy*, and clearing its bit
- * because it was busy would put it at the front of the eviction queue the instant it
- * was unpinned. Leaving the bit set means it is still owed a second chance the next
- * time it becomes reachable.
+ * The never-select-a-busy-page rule
+ * ---------------------------------
+ * A frame is a candidate only when it holds no pin and its bytes are not in motion, and all
+ * three of those conditions are checked here rather than by the caller. That is not a
+ * restatement of the caller's job; it is where the rule belongs.
  *
- * The caller holds the pool latch, so choosing a frame and reporting it is a single
- * step with respect to every other thread. The replacer calls nothing, blocks nowhere,
- * and cannot be interrupted between "this frame" and "this frame's index".
+ * Pin counts first, because a pinned frame is by far the common case and the others are
+ * implied by it: a frame being loaded from the disk is pinned for the duration, and so is
+ * one being written to it. Checking all three anyway costs two predictable branches per
+ * examined frame and buys the thing that matters - the caller does not have to loop
+ * looking for a second candidate, and therefore cannot spin if a frame turns out to be
+ * busy after the sweep picked it.
+ *
+ * A skipped frame's reference bit is *left alone*, and that is the one place where a naive
+ * clock goes subtly wrong: a page that was pinned across a long sweep is not "recently
+ * used", it is *busy*, and clearing its bit because it was busy would put it at the front
+ * of the eviction queue the instant it was unpinned. Leaving the bit set means it is still
+ * owed a second chance the next time it becomes reachable.
+ *
+ * The caller holds the pool latch, so choosing a frame and reporting it is a single step
+ * with respect to every other thread. The replacer calls nothing, blocks nowhere, and cannot
+ * be interrupted between "this frame" and "this frame's index".
  */
 
 void astra_replacer_record_access(astra_buffer_frame *frame)
@@ -87,13 +97,21 @@ bool astra_replacer_evict(astra_replacer *replacer,
      * product is at most two million and well inside a uint32. The bound is asserted in
      * buffer_internal.h rather than defended against here, because a pool that large
      * cannot be allocated and there is nothing to defend against.
+     *
+     * Two passes is what makes a false return trustworthy. The first clears the reference
+     * bit of every candidate it passes, so the second is guaranteed to find one if any
+     * candidate exists at all. With one pass a pool whose frames were all referenced since
+     * the last eviction would report "no victim" while holding nothing it was allowed to
+     * throw away, and the caller's fetch would fail with an error about pinned pages when
+     * none is pinned.
      */
     for (steps = 0u; steps < frame_count * 2u; ++steps) {
         examined = replacer->hand;
         replacer->hand = (replacer->hand + 1u) % frame_count;
         ++looked_at;
 
-        if (frames[examined].pin_count > 0u) {
+        if (frames[examined].pin_count > 0u || frames[examined].is_loading
+            || frames[examined].write_latched) {
             /* Busy. Skipped, and its reference bit deliberately not cleared. */
             continue;
         }

@@ -68,12 +68,14 @@ struct astra_test_thread {
     astra_test_thread_handle handle;
 };
 
-/* Records a check from a worker thread. */
-static void thread_fail(void)
-{
-    ++astra_test_failures;
-}
-
+/*
+ * Records a check from a worker thread.
+ *
+ * Failure counting belongs to astra_test_report_failure and to nothing else: a helper that
+ * incremented astra_test_failures itself would have to be paired with a reporter by
+ * convention, and getting that wrong double-counts the failure. There is exactly one way
+ * to record a failed check here and this is it.
+ */
 static void thread_check(bool condition, const char *expression, int line)
 {
     ++astra_test_checks;
@@ -2269,7 +2271,6 @@ static void phase1_worker(void *raw)
     for (uint32 n = 0u; n < arg->iterations; ++n) {
         uint32 slot = (uint32)(prng_next(&rng) % 4u);
         astra_page *page = NULL;
-        uint32 pins = 0u;
         astra_status status;
 
         status = astra_buffer_pool_fetch_page(shared->pool, shared->base + (page_id_t)slot,
@@ -2303,8 +2304,6 @@ static void phase1_worker(void *raw)
             atomic_fetch_add(&shared->errors, 1u);
             return;
         }
-
-        (void)pins;
     }
 }
 
@@ -2599,9 +2598,6 @@ void astra_test_buffer_threads(void)
                 if (page_check(check, id, generation)) {
                     matched = true;
                 }
-            }
-            if (!matched) {
-                thread_fail();
             }
             thread_check(matched, "page contents are from some generation a thread wrote",
                          __LINE__);

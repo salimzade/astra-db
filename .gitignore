@@ -36,6 +36,11 @@ install_manifest.txt
 *.gcov
 coverage/
 
+# Temporary databases created by the test suite. The suite puts them in the
+# working directory it was launched from, so an interrupted or failed run can
+# leave them behind; they are fixtures, not source.
+astra_disk_test_*/
+
 # Editors and IDEs
 .vscode/
 .idea/

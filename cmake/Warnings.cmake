@@ -74,8 +74,13 @@ endfunction()
 
 # Applies the sanitizers requested through the ASTRA_SANITIZE cache variable.
 #
-# Accepted values: none, address, undefined, address+undefined.
-# Anything else is a configuration error rather than a silently ignored typo.
+# Accepted values: none, address, undefined, thread, and the combinations
+# address+undefined and address+thread. Anything else is a configuration error
+# rather than a silently ignored typo.
+#
+# ThreadSanitizer is a separate instrument from the other two and cannot be combined
+# with AddressSanitizer, so `address+thread` is deliberately not offered: asking for both
+# produces binaries that report neither. Use one or the other, in two build directories.
 function(astra_target_sanitize target)
     if(NOT DEFINED ASTRA_SANITIZE OR ASTRA_SANITIZE STREQUAL "" OR ASTRA_SANITIZE STREQUAL "none")
         return()
@@ -89,17 +94,23 @@ function(astra_target_sanitize target)
     if(_astra_sanitize STREQUAL "undefined" OR _astra_sanitize STREQUAL "address+undefined")
         set(_astra_want_ub TRUE)
     endif()
+    if(_astra_sanitize STREQUAL "thread")
+        set(_astra_want_tsan TRUE)
+    endif()
 
-    if(NOT _astra_want_address AND NOT _astra_want_ub)
+    if(NOT _astra_want_address AND NOT _astra_want_ub AND NOT _astra_want_tsan)
         message(FATAL_ERROR
             "ASTRA_SANITIZE='${ASTRA_SANITIZE}' is not recognised. Use one of: "
-            "none, address, undefined, address+undefined.")
+            "none, address, undefined, address+undefined, thread.")
     endif()
 
     if(MSVC)
-        # MSVC offers AddressSanitizer only; UBSan is not available for it.
+        # MSVC offers AddressSanitizer only; UBSan and TSan are not available for it.
         if(_astra_want_ub AND NOT _astra_want_address)
             message(FATAL_ERROR "MSVC supports only ASTRA_SANITIZE=address, not 'undefined'.")
+        endif()
+        if(_astra_want_tsan)
+            message(FATAL_ERROR "MSVC does not provide ThreadSanitizer; use GCC or Clang.")
         endif()
         if(_astra_want_address)
             # /Zi as well as /fsanitize=address: MSVC emits C5072 when ASan is
@@ -110,6 +121,22 @@ function(astra_target_sanitize target)
             target_link_options(${target} PRIVATE /fsanitize=address)
         endif()
     else()
+        if(_astra_want_tsan)
+            # TSan stands alone. Combining it with ASan is not a supported pairing on
+            # any of the compilers this project targets, so a request for both is refused
+            # at configure time rather than producing a binary that detects neither.
+            if(_astra_want_address OR _astra_want_ub)
+                message(FATAL_ERROR
+                    "ASTRA_SANITIZE='${ASTRA_SANITIZE}' asks for ThreadSanitizer together with "
+                    "another sanitizer, which cannot be instrumented together. Build them in "
+                    "separate build directories: -DASTRA_SANITIZE=thread and "
+                    "-DASTRA_SANITIZE=address+undefined.")
+            endif()
+            target_compile_options(${target} PRIVATE -fsanitize=thread)
+            target_link_options(${target} PRIVATE -fsanitize=thread)
+            return()
+        endif()
+
         if(_astra_want_address)
             list(APPEND _astra_sanitize_opts -fsanitize=address)
         endif()

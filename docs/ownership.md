@@ -159,14 +159,71 @@ The rules that follow from that:
   library removes nothing on close, including the file it just made if the write
   of the header failed. A failed create removes its own half-built file, because a
   file that can never be opened is not a database, but it leaves the directory.
+* **A Disk Manager under a Buffer Pool is used by one thread at a time.** The
+  manager holds one file position and one cached page count and has no internal
+  synchronisation. The Buffer Pool's own latch is what serialises access, and it is
+  always released before a manager call, so the manager never sees two threads at
+  once. A caller that uses a manager directly *and* hands it to a pool is using it
+  concurrently with itself.
 
-Nothing in AstraDB owns a lock or a thread at this phase. When something does,
-its constructor takes an owner and its destructor names what it releases. An
-object with no documented destructor is not finished.
+The Buffer Pool is the second object that owns a persistent resource, so the same
+questions apply:
 
-### 12. Process-global state is enumerated and justified
+| Resource | Owned by | Acquired | Released |
+| --- | --- | --- | --- |
+| Every frame buffer | One `astra_buffer_pool` | `astra_buffer_pool_create` / `_open` | `astra_buffer_pool_destroy` |
+| The page table and retired set | One `astra_buffer_pool` | with the frames | `astra_buffer_pool_destroy` |
+| The registry slot | The library, once per manager | `astra_buffer_pool_open` | `astra_buffer_pool_destroy` |
 
-There are exactly four pieces of mutable global state, all documented at their
+* **`astra_buffer_pool_destroy` is the only release**, and it writes the dirty
+  frames first. A pool destroyed without its writes flushed is not a pool that
+  forgot something; that is why there is no `_free` and no `_close` that skips
+  the flush.
+* **A pool is thread safe; the manager it borrows is not.** That asymmetry is
+  deliberate and is the reason a pool takes a borrowed `astra_disk_manager *`
+  rather than creating one: the pool is the synchronisation layer that the manager
+  lacks.
+* **A pool borrows its manager and never frees it.** Closing a pool leaves the
+  caller's manager exactly as it was.
+* **One pool per manager.** The registry exists so that a second pool over the
+  same file is refused rather than silently allowed to run two independent caches
+  over one file. There is no reference counting and no shared cache.
+
+### 12. A borrowed page pointer is valid exactly as long as its pin
+
+`astra_buffer_pool_fetch_page` and `astra_buffer_pool_new_page` return an
+`astra_page *` that the pool owns. The caller does not own it and must not release
+it.
+
+```c
+astra_page *page = NULL;
+if (astra_buffer_pool_fetch_page(pool, id, &page) == ASTRA_OK) {
+    /* `page` is readable and writable here, and only here. */
+    page_fill(page, id, 7u);
+}
+if (page != NULL) {
+    /* Exactly one unpin per successful fetch, no matter which path got here. */
+    (void)astra_buffer_pool_unpin_page(pool, id, true);
+}
+```
+
+- **One pin per fetch, one unpin per pin.** A fetch that succeeds and is never
+  unpinned leaks the frame for the pool's lifetime, and eventually every fetch
+  fails with `ASTRA_ERR_INVALID_STATE`.
+- **Unpinning is what may invalidate the pointer.** Any eviction can take the
+  frame the instant the count reaches zero. After `astra_buffer_pool_unpin_page`
+  returns, the pointer is dangling and reading it is undefined behaviour.
+- **Unpinning does not require the latch, and does not block.** A caller that
+  never unpins cannot make another caller's `flush_all` hang.
+- **The `dirty` argument is the caller's promise about its own writes.** Passing
+  `false` for a page that was modified discards the modification at the next
+  eviction, by contract rather than by accident.
+- **A fetch that returns an error returns no page.** `*out_page` is NULL and no
+  unpin is owed.
+
+### 13. Process-global state is enumerated and justified
+
+There are exactly five pieces of mutable global state, all documented at their
 definition:
 
 | Global | File | Justification | Thread safety |
@@ -175,10 +232,13 @@ definition:
 | `g_min_level` | `log.c` | The log level changes while the server runs | C11 atomic |
 | `g_ops` | `allocator.c` | A process cannot sensibly have two allocators | Not atomic; install at startup |
 | `g_sink` / `g_sink_context` | `log.c` | Test-only redirection; private header | Not atomic; set before concurrency |
+| `g_pool_owners` | `buffer_pool.c` | Fixed-size slot table enforcing one pool per Disk Manager | C11 atomics; claim is a CAS |
 
-The last two are deliberate, documented exceptions to the project's "no hidden
-global mutable state" principle. If you add a fifth, expect to justify it in the
-same place.
+The last three are deliberate, documented exceptions to the project's "no hidden
+global mutable state" principle. `g_pool_owners` is the only one that participates
+in concurrency, and it is a fixed-size array of atomics rather than a list so that
+claiming a slot is a single compare-and-swap with no lock and no allocation.
+
 
 ## Ownership in the storage module
 

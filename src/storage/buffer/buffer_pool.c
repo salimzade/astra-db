@@ -23,29 +23,37 @@
  * which must not be called with the latch held. So eviction is a four-step dance in
  * pool_choose_frame, and each step exists to close a hole the previous one opened:
  *
- *   1. Wait for the victim to be quiet. A frame that is still being loaded into, or
- *      being written out, is not a candidate: its bytes are in motion, and the page it
- *      appears to hold may not even be the page whose name is on it yet.
- *   2. Pin the victim and take its write latch, then drop the latch and write.
- *      The pin is what stops a third thread from choosing this same frame as its own
- *      victim while the write is in flight.
- *   3. Leave the victim's old key in the page table for the whole write, and have the
- *      fetch hit path wait on `write_latched` while it is set. This is the subtle one.
- *      If the old key were removed first, a concurrent fetch of the *old* page would
- *      miss, take a different frame, and read the page from disk - which it can do
- *      correctly, but only because the write has not landed yet. Worse, it could read
- *      the page *after* the write lands and *before* the old key is gone, and cache a
- *      second copy of a page the pool is in the middle of deleting from its table. Two
- *      frames, one page identifier, and a stale copy is exactly the bug that a buffer
- *      pool is supposed to make impossible. Keeping the key in place and making fetchers
- *      wait means there is never an instant at which the page is neither resident nor
- *      accounted for.
- *   4. Only once the write has returned does the old key come out and the new one go in.
+ *   1. Choose a frame that is not in motion. The replacer skips any frame that is pinned,
+ *      loading or being written, so by construction it cannot hand back a frame whose
+ *      bytes are on their way to or from the disk.
+ *   2. Unlink the victim from the page table *before* writing it, and pin it as it is
+ *      unlinked. Both halves matter and they answer different objections. The unlink
+ *      means no lookup can find the frame during the write, so no fetch can hand its
+ *      buffer to a caller who is about to have it overwritten; the pin means the clock,
+ *      which reads pin counts rather than the page table, cannot select the same frame
+ *      again while this thread is still inside the write. Together they are what "this
+ *      frame is mine until I say otherwise" means.
+ *   3. Write the dirty victim, with the latch dropped. The frame keeps its own page_id
+ *      throughout - only the table entry is gone, not the page - because that identifier
+ *      is the one the Disk Manager checks the buffer against.
+ *   4. Bind the frame to the page that was wanted and publish it once the read that
+ *      follows has returned.
+ *
+ * Unlinking first is the non-obvious half. The alternative - leaving the old key in place
+ * during the write and making fetchers wait on `write_latched` - sounds safer, and it is
+ * worse: `pool_write_frame` releases the latch, so for the whole duration of the write a
+ * frame is reachable *and* about to be claimed for a different page. A fetch that pins it
+ * in that window has its pin count overwritten by astra_frame_claim, so its caller is
+ * left holding a buffer that now belongs to somebody else and an unpin that reports a
+ * page it was just given as missing. No assertion fires, no file is corrupted, and the
+ * failure surfaces in a different thread from the one that caused it. Being unfindable
+ * and pinned is the only pair of properties that leaves no window at all.
  *
  * A write that fails stops the eviction. The frame is left holding its old page, still
- * dirty, still mapped, with its reference bit cleared - so the very next fetch retries it
- * and reports the failure again, and the caller's data is still there rather than
- * silently gone.
+ * dirty, and it is linked back into the table - so the very next fetch retries it and
+ * reports the failure again, and the caller's data is still there rather than silently
+ * gone. Failing to re-link would be worse than a failed fetch: the page would sit in a
+ * frame nothing can find while the next read of it loaded a second copy from the disk.
  */
 #include "storage/buffer/buffer_internal.h"
 
@@ -165,47 +173,16 @@ static uint32 pool_find(const astra_buffer_pool *pool, page_id_t page_id)
  * Waits until the frame at `index` is not being loaded into and not being written.
  *
  * One predicate, two flags, because there is only one useful thing to do about either:
- * wait. The two are checked together rather than in sequence so that a waiter cannot
- * sleep through a load that finished just before a write started.
+ * wait. The two are checked together rather than in sequence so that a waiter cannot sleep
+ * through a load that finished just before a write started.
  *
- * `waiters` is a diagnostic, incremented on the way in and decremented on the way out so
- * the count always describes threads between their check and their sleep. The tests use
- * it to assert that a contended fetch really blocked rather than spun.
+ * Latch held on entry and on exit.
  */
-static void astra_probe(const astra_buffer_pool *pool,
-                        uint32 index,
-                        page_id_t page_id,
-                        const astra_page *page,
-                        bool waited,
-                        const char *where)
-{
-    uint32 idx = astra_page_table_find(&pool->table, pool->frames.frames, page_id);
-
-    if (idx == ASTRA_FRAME_NONE || &pool->frames.frames[idx].page != page ||
-        pool->frames.frames[idx].pin_count == 0u) {
-        fprintf(stderr,
-                "PROBE[%s] asked=%llu our_idx=%u our_pid=%llu our_pin=%u waited=%d "
-                "table=%u table_pid=%llu table_pin=%u\n",
-                where, (unsigned long long)page_id, (unsigned)index,
-                (unsigned long long)pool->frames.frames[index].page_id,
-                (unsigned)pool->frames.frames[index].pin_count, (int)waited,
-                (unsigned)idx,
-                (unsigned long long)(idx == ASTRA_FRAME_NONE
-                                         ? 0u
-                                         : pool->frames.frames[idx].page_id),
-                (unsigned)(idx == ASTRA_FRAME_NONE ? 0u
-                                                   : pool->frames.frames[idx].pin_count));
-        fflush(stderr);
-    }
-}
-
 static void pool_wait_idle(astra_buffer_pool *pool, uint32 index)
 {
-    ++pool->waiters;
     while (pool->frames.frames[index].is_loading || pool->frames.frames[index].write_latched) {
         astra_latch_wait(&pool->latch);
     }
-    --pool->waiters;
 }
 
 /**
@@ -228,122 +205,41 @@ static void pool_wait_idle(astra_buffer_pool *pool, uint32 index)
  * pinning the frame, so an unpinned wait there races the replacer and returns the caller a
  * buffer belonging to a different page under the right page's name.
  *
- * The pin belongs to the caller, which must release it. Callers that go on to write the
- * frame hand a second pin to pool_write_frame, and the two are independent; nothing here
- * releases the caller's pin, so the unpin that follows must.
+ * The pin belongs to the caller, which must release it with pool_release_pin. Callers that
+ * go on to write the frame hand a second pin to pool_write_frame, and the two are
+ * independent; nothing here releases the caller's pin, so the unpin that follows must.
  *
  * Latch held on entry and on exit.
  */
-/* TEMP DIAGNOSTIC: per-frame ring trace of every pin mutation, dumped at the first
- * underflow. Per-frame rather than global so the dump is not swamped by other threads. */
-#define ASTRA_TRACE_FRAMES 16
-#define ASTRA_TRACE_DEPTH 4096
-static struct {
-    unsigned long tid;
-    unsigned before;
-    unsigned after;
-    const char *where;
-} g_ftrace[ASTRA_TRACE_FRAMES][ASTRA_TRACE_DEPTH];
-static volatile long g_ftrace_n[ASTRA_TRACE_FRAMES];
-static int g_traced;
-
-static unsigned long pool_self(void)
+static void pool_pin_and_wait(astra_buffer_pool *pool, uint32 index)
 {
-#ifdef _WIN32
-    return (unsigned long)GetCurrentThreadId();
-#else
-    return (unsigned long)pthread_self();
-#endif
+    ++pool->frames.frames[index].pin_count;
+    pool_wait_idle(pool, index);
 }
 
-static void pool_trace(unsigned idx, unsigned before, unsigned after, const char *where)
+/**
+ * Drops one pin, and wakes anybody waiting for the frame to become evictable.
+ *
+ * Every pin the pool gives itself goes back through here, so that "the count reached zero,
+ * and someone may be sweeping behind me" is stated once. The broadcast is inside the
+ * decrement rather than after it, because a waiter re-checks its predicate under the latch
+ * and a broadcast issued after the latch has been released could be missed entirely.
+ *
+ * The pin count is not checked. Every caller of this function holds a pin it was given, and
+ * a caller that does not is a caller that has already lost track of its own frame; the
+ * public unpin is where that mistake is reported, and it is reported to the caller rather
+ * than absorbed here.
+ *
+ * Latch held on entry and on exit.
+ */
+static void pool_release_pin(astra_buffer_pool *pool, uint32 index)
 {
-    long n;
-
-    if (idx >= ASTRA_TRACE_FRAMES) {
-        return;
+    if (pool->frames.frames[index].pin_count > 0u) {
+        --pool->frames.frames[index].pin_count;
     }
-
-    n = g_ftrace_n[idx];
-    g_ftrace[idx][n % ASTRA_TRACE_DEPTH].tid = pool_self();
-    g_ftrace[idx][n % ASTRA_TRACE_DEPTH].before = before;
-    g_ftrace[idx][n % ASTRA_TRACE_DEPTH].after = after;
-    g_ftrace[idx][n % ASTRA_TRACE_DEPTH].where = where;
-    g_ftrace_n[idx] = n + 1;
-}
-
-static void pool_trace_dump(unsigned idx)
-{
-    long i;
-    long n = g_ftrace_n[idx];
-    long start = n > ASTRA_TRACE_DEPTH ? n - ASTRA_TRACE_DEPTH : 0;
-
-    for (i = start; i < n; ++i) {
-        fprintf(stderr, "  TRACE[%u] tid=%lu %u->%u %s\n", idx,
-                g_ftrace[idx][i % ASTRA_TRACE_DEPTH].tid,
-                g_ftrace[idx][i % ASTRA_TRACE_DEPTH].before,
-                g_ftrace[idx][i % ASTRA_TRACE_DEPTH].after,
-                g_ftrace[idx][i % ASTRA_TRACE_DEPTH].where);
-    }
-    fflush(stderr);
-}
-
-static void pool_trace_claim(astra_buffer_pool *pool, uint32 index, const char *where)
-{
-    pool_trace((unsigned)index, pool->frames.frames[index].pin_count, 1u, where);
-}
-
-static void pool_trace_release(astra_buffer_pool *pool, uint32 index, const char *where)
-{
-    pool_trace((unsigned)index, pool->frames.frames[index].pin_count, 0u, where);
-}
-
-/* TEMP DIAGNOSTIC: every pin release goes through here so an underflow names its site. */
-static void pool_drop_pin(astra_buffer_pool *pool, uint32 index, const char *where)
-{
-    unsigned before = pool->frames.frames[index].pin_count;
-
-    pool_trace((unsigned)index, before, before == 0u ? 0u : before - 1u, where);
-
-    if (before == 0u) {
-        if (!g_traced) {
-            g_traced = 1;
-            pool_trace_dump((unsigned)index);
-        }
-        fprintf(stderr, "UNDERFLOW idx=%u pid=%llu at %s\n", (unsigned)index,
-                (unsigned long long)pool->frames.frames[index].page_id, where);
-        fflush(stderr);
-        return;
-    }
-
-    --pool->frames.frames[index].pin_count;
     if (pool->frames.frames[index].pin_count == 0u) {
         astra_latch_broadcast(&pool->latch);
     }
-}
-
-static bool pool_pin_and_wait(astra_buffer_pool *pool, uint32 index)
-{
-    uint32 before = pool->frames.frames[index].pin_count;
-    bool busy = pool->frames.frames[index].is_loading ||
-                pool->frames.frames[index].write_latched;
-
-    ++pool->frames.frames[index].pin_count;
-    pool_trace((unsigned)index, before, before + 1u, "pin_and_wait");
-    pool_wait_idle(pool, index);
-
-    if (before != 0u || busy ||
-        pool->frames.frames[index].pin_count != before + 1u) {
-        fprintf(stderr,
-                "PINWAIT idx=%u pid=%llu before=%u after=%u loading=%d wlatched=%d\n",
-                (unsigned)index, (unsigned long long)pool->frames.frames[index].page_id,
-                (unsigned)before, (unsigned)pool->frames.frames[index].pin_count,
-                (int)pool->frames.frames[index].is_loading,
-                (int)pool->frames.frames[index].write_latched);
-        fflush(stderr);
-    }
-
-    return busy;
 }
 
 /*
@@ -385,8 +281,6 @@ static astra_status pool_write_frame(astra_buffer_pool *pool, uint32 index, page
     }
 
     pool->frames.frames[index].write_latched = true;
-    pool_trace((unsigned)index, pool->frames.frames[index].pin_count,
-              pool->frames.frames[index].pin_count + 1u, "write_frame+");
     ++pool->frames.frames[index].pin_count;
 
     astra_latch_unlock(&pool->latch);
@@ -394,7 +288,7 @@ static astra_status pool_write_frame(astra_buffer_pool *pool, uint32 index, page
     astra_latch_lock(&pool->latch);
 
     pool->frames.frames[index].write_latched = false;
-    pool_drop_pin(pool, index, "write_frame-");
+    pool_release_pin(pool, index);
 
     if (status == ASTRA_OK) {
         /* Cleared only on success. A failed write must leave the page dirty, so that the
@@ -424,7 +318,10 @@ static astra_status pool_write_frame(astra_buffer_pool *pool, uint32 index, page
  *
  * A cold frame cannot need a flush and cannot be busy, because "cold" means it has never
  * been claimed and so has never been loaded into or written from. Only a victim goes
- * through the four-step dance described at the top of this file.
+ * through the eviction dance described at the top of this file - and a victim is, by
+ * construction, a frame the replacer has already established is neither pinned nor in
+ * motion, so this function does not have to loop looking for a second candidate and
+ * cannot spin.
  *
  * On success the frame is pinned, and is *not* in the page table under the new page's
  * key. That is what makes the gap between reserving and publishing invisible: a
@@ -438,16 +335,14 @@ static astra_status pool_write_frame(astra_buffer_pool *pool, uint32 index, page
  * would add a table lookup and a wakeup to every miss, including the common single-
  * threaded one.
  *
- * A cold frame is nevertheless bound to the incoming identifier, because a frame's own
- * `page_id` is what the page table compares against and the invariant "a frame in the
- * table carries the key it is filed under" has to hold from the moment it is bound.
+ * `page_id` may be ASTRA_PAGE_ID_INVALID, which is how the new-page path calls this: the
+ * identifier does not exist until the file has been extended, and a frame bound to
+ * nothing is invisible and untouchable, which is exactly what a reservation wants to be.
  *
  * Latch held on entry and on exit. `out_cold` reports which of the two sources was used,
  * because the caller has to be able to undo the reservation correctly if the load or the
- * allocation that follows it fails: a cold frame is handed back to the cold cursor, and a
- * clock victim is simply released. Getting that backwards is not a cosmetic bug - it either
- * loses a frame for the pool's lifetime or reintroduces a frame the cursor already passed,
- * and neither shows up until the pool is under memory pressure.
+ * allocation that follows it fails - see pool_abandon_frame, which is where the
+ * difference matters.
  *
  * Returns ASTRA_OK, ASTRA_ERR_INVALID_STATE when every frame is pinned, or the Disk
  * Manager's status if a dirty victim could not be written.
@@ -464,7 +359,6 @@ static astra_status pool_choose_frame(astra_buffer_pool *pool,
     if (pool->frames.fresh_next < pool->frames.count) {
         index = pool->frames.fresh_next;
         ++pool->frames.fresh_next;
-        pool_trace_claim(pool, index, "claim cold");
         astra_frame_claim(&pool->frames.frames[index], page_id);
         ++pool->frames.used;
         *out_index = index;
@@ -472,91 +366,80 @@ static astra_status pool_choose_frame(astra_buffer_pool *pool,
         return ASTRA_OK;
     }
 
-    for (;;) {
-        if (!astra_replacer_evict(&pool->replacer, pool->frames.frames, pool->frames.count,
-                                  &examined, &index)) {
-            /*
-             * Two complete sweeps and nothing unpinned, which - see the replacer - can
-             * only mean every frame is pinned. The caller is holding more pages than the
-             * pool has frames. It is not waited for and it is not stolen from: both would
-             * make the pool's behaviour depend on a thread the caller does not control.
-             */
-            return ASTRA_ERR_INVALID_STATE;
-        }
-        pool->replacement_count += examined;
+    if (!astra_replacer_evict(&pool->replacer, pool->frames.frames, pool->frames.count,
+                              &examined, &index)) {
+        /*
+         * Two complete sweeps and nothing evictable, which - see the replacer - can only
+         * mean every frame is pinned. The caller is holding more pages than the pool has
+         * frames. It is not waited for and it is not stolen from: both would make the
+         * pool's behaviour depend on a thread the caller does not control.
+         */
+        return ASTRA_ERR_INVALID_STATE;
+    }
+    pool->replacement_count += examined;
 
-        /* Step 1: a frame in motion is not a candidate. */
-        if (pool->frames.frames[index].is_loading || pool->frames.frames[index].write_latched) {
-            continue;
-        }
+    /*
+     * The old key comes out of the page table, and it comes out **before** the frame is
+     * written, not after.
+     *
+     * The order is the whole correctness of this function, and getting it wrong is silent.
+     * pool_write_frame drops the latch to do the write, and during that window a frame
+     * that is still filed under its old key is a frame a concurrent fetch can find, pin,
+     * and start using. The eviction then comes back, claims the frame for a different
+     * page, and astra_frame_claim overwrites the pin count with 1 - so the fetch's pin is
+     * erased rather than released. Its caller is holding a buffer that now belongs to
+     * somebody else, its unpin drives the count below zero, and the pool reports the page
+     * as missing to a caller that was handed it moments earlier. No assertion fires, no
+     * file is corrupted, and the failure appears in a different thread from the one that
+     * caused it.
+     *
+     * Unlinking first closes the window from the other side: for the whole of the write
+     * the frame is pinned (so the clock cannot choose it) and unfindable (so no lookup
+     * can name it), and those two together are what "this frame is mine until I say
+     * otherwise" means. A frame that is dirty and reachable is a frame two threads are
+     * about to disagree about.
+     */
+    if (pool->frames.frames[index].in_table) {
+        page_id_t old_page_id = pool->frames.frames[index].page_id;
+
+        (void)astra_page_table_remove(&pool->table, pool->frames.frames, old_page_id);
 
         /*
-         * Step 2: the old key comes out of the page table, and it comes out **before** the
-         * frame is written, not after.
-         *
-         * The order is the whole correctness of this function, and getting it wrong is
-         * silent. pool_write_frame drops the latch to do the write, and during that window
-         * a frame that is still filed under its old key is a frame a concurrent fetch can
-         * find, pin, and start using. The eviction then comes back, claims the frame for a
-         * different page, and astra_frame_claim overwrites the pin count with 1 - so the
-         * fetch's pin is erased rather than released. Its caller is holding a buffer that
-         * now belongs to somebody else, its unpin drives the count below zero, and the pool
-         * reports the page as missing to a caller that was handed it moments earlier. No
-         * assertion fires, no file is corrupted, and the failure appears in a different
-         * thread from the one that caused it.
-         *
-         * Unlinking first closes the window from the other side: for the whole of the write
-         * the frame is pinned (so the clock cannot choose it) and unfindable (so no lookup
-         * can name it), and those two together are what "this frame is mine until I say
-         * otherwise" means. A frame that is dirty and reachable is a frame two threads are
-         * about to disagree about.
+         * The old occupant stops being resident, and the new one starts. Written as a
+         * pair rather than as nothing at all because the two are not the same operation:
+         * incrementing without decrementing makes `used` count evictions instead of
+         * frames, so it climbs past the pool's own size and a caller watching it has no
+         * way to tell a busy pool from a broken counter.
          */
-        if (pool->frames.frames[index].in_table) {
-            (void)astra_page_table_remove(&pool->table, pool->frames.frames,
-                                         pool->frames.frames[index].page_id);
-            /*
-             * The old occupant stops being resident, and the new one starts. Written as
-             * a pair rather than as nothing at all because the two are not the same
-             * operation: incrementing without decrementing makes `used` count evictions
-             * instead of frames, so it climbs past the pool's own size and a caller
-             * watching it has no way to tell a busy pool from a broken counter.
-             */
-            --pool->frames.used;
-
-            /*
-             * Pinned here, at the moment the frame is unlinked, and this is the second
-             * half of the invariant the unlink alone does not establish.
-             *
-             * Unlinking makes the frame unfindable, but the clock does not look in the
-             * page table - it looks at pin counts. Between this unlink and the claim
-             * below, the frame is unpinned, not loading, and not being written, which is
-             * exactly the state astra_replacer_evict reports as a valid victim. pool_write_frame
-             * drops the latch to do the write, so a concurrent eviction really can sweep
-             * past and re-select this same frame. It would then remove the old key a
-             * second time, underflow `used`, and claim the frame for its own page while
-             * this thread is still inside the write - leaving one frame chained under two
-             * page identifiers, which is the corruption this whole dance is meant to
-             * prevent. A clean victim is the likely trigger, because a clean frame never
-             * sets write_latched and so is never caught by the step 1 check above.
-             *
-             * The pin is not released on the paths below: astra_frame_claim overwrites the
-             * count with 1, which is the reservation this thread is about to hand back to
-             * its caller. So the pin taken here *becomes* the caller's pin rather than
-             * being an extra one, and the only path that has to undo it by hand is the
-             * failed-write path below.
-             */
-            pool_trace((unsigned)index, pool->frames.frames[index].pin_count,
-                      pool->frames.frames[index].pin_count + 1u, "evict temp+");
-            ++pool->frames.frames[index].pin_count;
-        }
+        --pool->frames.used;
 
         /*
-         * Step 3: the dirty victim is written, now that nothing can reach it. The frame
-         * keeps its own page_id throughout, because that is the identity the Disk Manager
-         * checks the buffer against; only the *table entry* is gone, not the page.
+         * Pinned here, at the moment the frame is unlinked, and this is the second half
+         * of the invariant the unlink alone does not establish.
+         *
+         * Unlinking makes the frame unfindable, but the clock does not look in the page
+         * table - it looks at pin counts. Between this unlink and the claim below, the
+         * frame is unpinned, not loading and not being written, which is exactly the
+         * state astra_replacer_evict reports as a valid victim. pool_write_frame drops
+         * the latch to do the write, so a concurrent eviction really can sweep past and
+         * re-select this same frame. It would then remove the old key a second time,
+         * underflow `used`, and claim the frame for its own page while this thread is
+         * still inside the write - leaving one frame chained under two page identifiers,
+         * which is the corruption this whole dance is meant to prevent.
+         *
+         * The pin is not released on the paths below: astra_frame_claim overwrites the
+         * count with 1, which is the reservation this thread is about to hand back to its
+         * caller. So the pin taken here *becomes* the caller's pin rather than being an
+         * extra one, and the only path that has to undo it by hand is the failed-write
+         * path below.
          */
+        ++pool->frames.frames[index].pin_count;
+
+        /* The dirty victim is written, now that nothing can reach it. The frame keeps its
+         * own page_id throughout, because that is the identity the Disk Manager checks
+         * the buffer against; only the *table entry* is gone, not the page. */
         if (pool->frames.frames[index].is_dirty) {
-            status = pool_write_frame(pool, index, pool->frames.frames[index].page_id);
+            status = pool_write_frame(pool, index, old_page_id);
             if (status != ASTRA_OK) {
                 /*
                  * The eviction is abandoned, not completed, and the key goes back in. The
@@ -572,24 +455,23 @@ static astra_status pool_choose_frame(astra_buffer_pool *pool,
                  * swallowed until a page of other evictions have gone past.
                  */
                 (void)astra_page_table_insert(&pool->table, pool->frames.frames,
-                                              pool->frames.frames[index].page_id, index);
+                                              old_page_id, index);
                 ++pool->frames.used;
-                pool_drop_pin(pool, index, "choose failed write");
+                pool_release_pin(pool, index);
                 return status;
             }
         }
-
-        /* Step 4: the frame is bound to its new page. It is still not in the table - the
-         * caller inserts it once the read has completed, which is what makes a reservation
-         * invisible to a concurrent fetch of the same identifier. */
-        pool_trace_claim(pool, index, "claim evict");
-        astra_frame_claim(&pool->frames.frames[index], page_id);
-        ++pool->frames.used;
-
-        *out_index = index;
-        *out_cold = false;
-        return ASTRA_OK;
     }
+
+    /* The frame is bound to its new page. It is still not in the table - the caller
+     * inserts it once the read has completed, which is what makes a reservation invisible
+     * to a concurrent fetch of the same identifier. */
+    astra_frame_claim(&pool->frames.frames[index], page_id);
+    ++pool->frames.used;
+
+    *out_index = index;
+    *out_cold = false;
+    return ASTRA_OK;
 }
 
 /**
@@ -632,7 +514,6 @@ static void pool_abandon_frame(astra_buffer_pool *pool, uint32 index, bool was_c
 {
     (void)was_cold;
 
-    pool_trace_release(pool, index, "abandon");
     astra_frame_release(&pool->frames.frames[index]);
     --pool->frames.used;
 
@@ -742,63 +623,93 @@ astra_status astra_buffer_pool_create(const astra_config *cfg,
 }
 
 /**
- * Writes every resident dirty page, reporting the first failure.
+ * How much of the pool a write-back sweep covers, and what it does about a failure.
  *
- * Shared by flush_all and destroy, which differ only in what they do afterwards. It
- * visits frames in index order - sequential access to the frame array, and flush_all
- * promises no ordering - and drops the latch for each write.
- *
- * The header page is handled once, up front, rather than as the sweep reaches it. A
- * clean page 0 is skipped: the Disk Manager refuses to write it and there is nothing to
- * write. A *dirty* page 0 fails the whole call, before any byte is written, because a
- * dirty header means a caller uninned page 0 with `dirty = true` and the pool is in a
- * state it cannot honestly report as flushed. Checking first means the file is left
- * exactly as it was rather than partly written.
+ * The two callers genuinely want different things and collapsing them would have made one
+ * of them lie. Destroy is on its way out and owes the caller every dirty byte it is
+ * holding, so it keeps going past a failure and reports the first one at the end.
+ * flush_all made a promise about the whole pool, so it stops at the first failure and says
+ * so: pages already written are on disk and the rest are not, and a caller that wants the
+ * rest has to know that to ask.
  */
-static astra_status pool_write_dirty_pages(astra_buffer_pool *pool)
+typedef enum pool_flush_mode {
+    /** Write the dirty frames, keep going after a failure, report the first one. */
+    POOL_FLUSH_DIRTY,
+
+    /** Write every resident frame, stop at the first failure. */
+    POOL_FLUSH_EVERY
+} pool_flush_mode;
+
+/**
+ * Writes resident frames, by frame index, and reports what happened.
+ *
+ * Shared by flush_all and destroy. It visits frames in index order - sequential access to
+ * the frame array, and neither caller promises an ordering - and drops the latch for each
+ * write, so a slow disk does not stop the pool being read.
+ *
+ * The header page is handled once, up front, rather than as the sweep reaches it. Page 0 is
+ * never written: the Disk Manager refuses it, because it is the file's magic number and
+ * checksum. A clean page 0 is simply skipped, and a *dirty* page 0 fails the whole call
+ * before any byte is written, because a dirty header means a caller unpinned page 0 with
+ * `dirty = true` and the pool is in a state it cannot honestly report as flushed. Checking
+ * first means the file is left exactly as it was rather than partly written.
+ *
+ * Latch held on entry and on exit.
+ */
+static astra_status pool_write_resident(astra_buffer_pool *pool, pool_flush_mode mode)
 {
     astra_status result = ASTRA_OK;
     astra_status status;
     uint32 index;
 
     for (index = 0u; index < pool->frames.count; ++index) {
-        if (!pool->frames.frames[index].in_table ||
-            !pool->frames.frames[index].is_dirty) {
-            continue;
-        }
-        if (pool->frames.frames[index].page_id == 0u) {
+        if (pool->frames.frames[index].in_table && pool->frames.frames[index].is_dirty
+            && pool->frames.frames[index].page_id == 0u) {
             return ASTRA_ERR_INVALID_STATE;
         }
     }
 
     for (index = 0u; index < pool->frames.count; ++index) {
-        if (!pool->frames.frames[index].in_table ||
-            !pool->frames.frames[index].is_dirty) {
+        page_id_t page_id;
+        bool wanted_dirty = pool->frames.frames[index].is_dirty;
+
+        if (!pool->frames.frames[index].in_table
+            || pool->frames.frames[index].page_id == 0u) {
+            continue;
+        }
+        if (mode == POOL_FLUSH_DIRTY && !wanted_dirty) {
             continue;
         }
 
         pool_pin_and_wait(pool, index);
 
         /*
-         * Re-checked, not assumed. Two things can have changed while the latch was
-         * released inside the wait: the frame may have stopped being dirty because another
-         * thread flushed it, and - had the wait not pinned it - the frame may have been
-         * evicted and given a different page. The pin makes the second impossible, and the
-         * re-read handles the first. Re-reading the frame rather than the cached decision
-         * is what keeps the two consistent.
+         * Re-checked, not assumed. Two things can have changed while the latch was released
+         * inside the wait: the frame may have stopped being dirty because another thread
+         * flushed it, and - had the wait not pinned it - the frame may have been evicted and
+         * given a different page. The pin makes the second impossible, and the re-read
+         * handles the first. Re-reading the frame rather than the cached decision is what
+         * keeps the two consistent, and it is also why `page_id` is read *after* the wait
+         * rather than before: a decision and the page it was made about have to be read in
+         * the same instant.
          */
-        if (!pool->frames.frames[index].is_dirty ||
-            !pool->frames.frames[index].in_table) {
-            pool_drop_pin(pool, index, "write_dirty skip");
+        if (!pool->frames.frames[index].in_table
+            || (mode == POOL_FLUSH_DIRTY && !pool->frames.frames[index].is_dirty)) {
+            pool_release_pin(pool, index);
             continue;
         }
 
-        status = pool_write_frame(pool, index, pool->frames.frames[index].page_id);
+        page_id = pool->frames.frames[index].page_id;
+        status = pool_write_frame(pool, index, page_id);
+        pool_release_pin(pool, index);
 
-        pool_drop_pin(pool, index, "write_dirty");
-
-        if (status != ASTRA_OK && result == ASTRA_OK) {
-            result = status;
+        if (status != ASTRA_OK) {
+            if (mode == POOL_FLUSH_EVERY) {
+                return status;
+            }
+            if (result == ASTRA_OK) {
+                result = status;
+            }
         }
     }
 
@@ -819,15 +730,14 @@ astra_status astra_buffer_pool_destroy(astra_buffer_pool *pool)
 
     /*
      * The latch is taken once, here, and held until the pool's memory is gone. Two of the
-     * three things below need it: the scan reads the frames, and pool_write_dirty_pages
+     * three things below need it: the scan reads the frames, and pool_write_resident
      * documents that it must be called with the latch held, because it calls
      * pool_write_frame - which drops and retakes the latch around every write. Calling it
      * unlocked would unlock a latch that was never locked, which is undefined rather than
      * merely wrong, and on a counting latch it corrupts the count for every later user.
      *
      * The header defines destroying a pool that other threads are still using as
-     * undefined, so the latch is not making that safe - it is making the defined case
-     * work.
+     * undefined, so the latch is not making that safe - it is making the defined case work.
      */
     astra_latch_lock(&pool->latch);
 
@@ -854,7 +764,7 @@ astra_status astra_buffer_pool_destroy(astra_buffer_pool *pool)
                        (unsigned long long)pins, (unsigned long long)dirty);
     }
 
-    result = pool_write_dirty_pages(pool);
+    result = pool_write_resident(pool, POOL_FLUSH_DIRTY);
 
     /* Durability is part of closing a pool, not a separate decision to remember. */
     if (result == ASTRA_OK) {
@@ -895,8 +805,6 @@ astra_status astra_buffer_pool_fetch_page(astra_buffer_pool *pool,
     astra_status status;
     uint32 index;
     bool cold = false;
-    bool hit_waited;
-    bool adopt_waited = false;
 
     if (pool == NULL || out_page == NULL) {
         return ASTRA_ERR_INVALID_ARGUMENT;
@@ -934,12 +842,11 @@ astra_status astra_buffer_pool_fetch_page(astra_buffer_pool *pool,
          * reporting the page it was asked for. The caller's unpin is what finally notices,
          * by failing to find a page it was just given.
          */
-        hit_waited = pool_pin_and_wait(pool, index);
+        pool_pin_and_wait(pool, index);
 
         astra_replacer_record_access(&pool->frames.frames[index]);
 
         *out_page = &pool->frames.frames[index].page;
-        astra_probe(pool, index, page_id, *out_page, hit_waited, "hit");
         astra_latch_unlock(&pool->latch);
         return ASTRA_OK;
     }
@@ -1013,13 +920,12 @@ astra_status astra_buffer_pool_fetch_page(astra_buffer_pool *pool,
              * since taken the frame, and its unpin of the page it asked for would find a
              * pin count of zero and report a double unpin that never happened.
              */
-            adopt_waited = pool_pin_and_wait(pool, winner);
+            pool_pin_and_wait(pool, winner);
 
             /* The pin the reservation took on `winner` is the pin this call returns, so it
              * is not incremented again. */
             astra_replacer_record_access(&pool->frames.frames[winner]);
             *out_page = &pool->frames.frames[winner].page;
-            astra_probe(pool, winner, page_id, *out_page, adopt_waited, "adopt");
 
             astra_latch_broadcast(&pool->latch);
             astra_latch_unlock(&pool->latch);
@@ -1039,7 +945,6 @@ astra_status astra_buffer_pool_fetch_page(astra_buffer_pool *pool,
 
     astra_replacer_record_access(&pool->frames.frames[index]);
     *out_page = &pool->frames.frames[index].page;
-    astra_probe(pool, index, page_id, *out_page, false, "publish");
 
     astra_latch_broadcast(&pool->latch);
     astra_latch_unlock(&pool->latch);
@@ -1062,83 +967,27 @@ astra_status astra_buffer_pool_new_page(astra_buffer_pool *pool,
     *out_page_id = ASTRA_PAGE_ID_INVALID;
 
     /*
-     * The frame is taken *before* the file is extended, so that a pool with nowhere to
-     * put the page fails without having created one. It is bound to
-     * ASTRA_PAGE_ID_INVALID meanwhile, which the page table's insert check refuses, so
-     * it cannot be linked under a key it does not hold. That leaves it pinned and
-     * invisible: no lookup can name it, and the clock cannot choose it because it is
-     * pinned. Nothing can observe a pool in this state.
+     * The frame is taken *before* the file is extended, so that a pool with nowhere to put
+     * the page fails without having created one.
+     *
+     * The identifier does not exist yet, so the reservation is made against
+     * ASTRA_PAGE_ID_INVALID: the frame is pinned, holds no page name, and is not in the
+     * page table - and the page table's insert check refuses an invalid key, so it cannot
+     * be filed under one. That leaves it invisible and untouchable: no lookup can name it
+     * and the clock cannot choose it because it is pinned. Nothing can observe a pool in
+     * this state.
+     *
+     * The eviction half is pool_choose_frame's, not a second copy of it. A new page needs a
+     * frame exactly as much as a fetch does, so a dirty victim here has to be written for
+     * the same reason and with the same unlink-then-pin ordering; a second implementation
+     * would be free to disagree with the first about both.
      */
     astra_latch_lock(&pool->latch);
 
-    if (pool->frames.fresh_next < pool->frames.count) {
-        index = pool->frames.fresh_next;
-        ++pool->frames.fresh_next;
-        pool_trace_claim(pool, index, "newpage claim cold");
-        astra_frame_claim(&pool->frames.frames[index], ASTRA_PAGE_ID_INVALID);
-        ++pool->frames.used;
-        cold = true;
-    } else {
-        uint64 examined;
-        uint32 victim;
-        bool chosen = astra_replacer_evict(&pool->replacer, pool->frames.frames,
-                                           pool->frames.count, &examined, &victim);
-        if (!chosen) {
-            astra_latch_unlock(&pool->latch);
-            return ASTRA_ERR_INVALID_STATE;
-        }
-        pool->replacement_count += examined;
-
-        if (pool->frames.frames[victim].is_loading || pool->frames.frames[victim].write_latched) {
-            astra_latch_unlock(&pool->latch);
-            return ASTRA_ERR_INVALID_STATE;
-        }
-
-        /* Unlinked before it is written, for the same reason as the eviction path: a
-         * frame that is still in the page table while the latch is down can be found,
-         * pinned and used by another thread, and this code is about to overwrite its pin
-         * count. */
-        if (pool->frames.frames[victim].in_table) {
-            (void)astra_page_table_remove(&pool->table, pool->frames.frames,
-                                          pool->frames.frames[victim].page_id);
-            --pool->frames.used;
-
-            /* Pinned across the write for the same reason as the eviction path: a frame
-             * that is unlinked but unpinned is a frame the clock will happily hand to
-             * another thread, because the clock reads pin counts and not the page table.
-             * astra_frame_release below resets the count to zero, so this pin is only
-             * load-bearing for the duration of the write. */
-            pool_trace((unsigned)victim, pool->frames.frames[victim].pin_count,
-                      pool->frames.frames[victim].pin_count + 1u, "newpage temp+");
-            ++pool->frames.frames[victim].pin_count;
-
-            if (pool->frames.frames[victim].is_dirty) {
-                /* Flushed, exactly as an eviction would, because a new page needs a frame
-                 * just as much as a fetch does and must not be the one case that drops a
-                 * dirty page on the floor. */
-                status = pool_write_frame(pool, victim, pool->frames.frames[victim].page_id);
-                if (status != ASTRA_OK) {
-                    /* Put the key back rather than stranding a dirty page in a frame
-                     * nothing can find. Same reasoning as the eviction path. */
-                    (void)astra_page_table_insert(&pool->table, pool->frames.frames,
-                                                  pool->frames.frames[victim].page_id, victim);
-                    ++pool->frames.used;
-                    pool_drop_pin(pool, victim, "new_page failed write");
-                    astra_latch_unlock(&pool->latch);
-                    return status;
-                }
-            }
-
-            pool_drop_pin(pool, victim, "new_page victim");
-        }
-
-        pool_trace_release(pool, victim, "newpage release victim");
-        astra_frame_release(&pool->frames.frames[victim]);
-
-        index = victim;
-        pool_trace_claim(pool, index, "newpage claim victim");
-        astra_frame_claim(&pool->frames.frames[index], ASTRA_PAGE_ID_INVALID);
-        ++pool->frames.used;
+    status = pool_choose_frame(pool, ASTRA_PAGE_ID_INVALID, &index, &cold);
+    if (status != ASTRA_OK) {
+        astra_latch_unlock(&pool->latch);
+        return status;
     }
 
     astra_latch_unlock(&pool->latch);
@@ -1164,7 +1013,6 @@ astra_status astra_buffer_pool_new_page(astra_buffer_pool *pool,
      * unpinned with `dirty = false`, or a process that dies before either. Erring towards
      * an extra write is the only asymmetry here that does not risk data.
      */
-    pool_trace_claim(pool, index, "newpage claim page");
     astra_frame_claim(&pool->frames.frames[index], page_id);
     pool->frames.frames[index].is_dirty = true;
     pool->frames.frames[index].page.is_dirty = true;
@@ -1231,7 +1079,7 @@ astra_status astra_buffer_pool_unpin_page(astra_buffer_pool *pool,
         return ASTRA_ERR_INVALID_STATE;
     }
 
-    pool_drop_pin(pool, index, "unpin_page");
+    pool_release_pin(pool, index);
 
     if (dirty) {
         /*
@@ -1302,7 +1150,7 @@ astra_status astra_buffer_pool_flush_page(astra_buffer_pool *pool, page_id_t pag
      * pool_write_frame takes its own pin for the duration of the write, so this one is
      * dropped here. */
     status = pool_write_frame(pool, index, page_id);
-    pool_drop_pin(pool, index, "flush_page");
+    pool_release_pin(pool, index);
 
     astra_latch_unlock(&pool->latch);
     return status;
@@ -1311,48 +1159,24 @@ astra_status astra_buffer_pool_flush_page(astra_buffer_pool *pool, page_id_t pag
 astra_status astra_buffer_pool_flush_all(astra_buffer_pool *pool)
 {
     astra_status status;
-    uint32 index;
 
     if (pool == NULL) {
         return ASTRA_ERR_INVALID_ARGUMENT;
     }
 
+    /*
+     * One sweep, not two. The obvious structure - write the dirty pages, then sweep again
+     * to write the clean ones - writes every dirty page twice and splits one guarantee
+     * across two passes. POOL_FLUSH_EVERY covers both in one walk: a clean page is written
+     * too, because "flush everything" is a claim about durability and a clean page's bytes
+     * on disk are exactly what it promised.
+     */
     astra_latch_lock(&pool->latch);
-    status = pool_write_dirty_pages(pool);
+    status = pool_write_resident(pool, POOL_FLUSH_EVERY);
     astra_latch_unlock(&pool->latch);
+
     if (status != ASTRA_OK) {
         return status;
-    }
-
-    /*
-     * Now every page is clean, and a clean page is written whether or not it was, because
-     * "flush everything" is a claim about durability and a page that was already clean is
-     * a page whose bytes on disk are already correct. Sweeping the resident frames here
-     * rather than folding it into pool_write_dirty_pages keeps the two callers honest:
-     * destroy wants only the dirty ones, because a clean page costs nothing to abandon,
-     * while flush_all wants all of them, because that is what it promised.
-     */
-    for (index = 0u; index < pool->frames.count; ++index) {
-        astra_latch_lock(&pool->latch);
-
-        if (!pool->frames.frames[index].in_table ||
-            pool->frames.frames[index].page_id == 0u) {
-            /* The header page is skipped, not refused, when it is clean: it cannot be
-             * written, and there is nothing to write. */
-            astra_latch_unlock(&pool->latch);
-            continue;
-        }
-
-        pool_pin_and_wait(pool, index);
-        status = pool_write_frame(pool, index, pool->frames.frames[index].page_id);
-        pool_drop_pin(pool, index, "flush_all");
-        astra_latch_unlock(&pool->latch);
-
-        if (status != ASTRA_OK) {
-            /* Stops at the first failure, as documented: pages already written are on
-             * disk, pages not yet visited are not, and the caller is told. */
-            return status;
-        }
     }
 
     /*
@@ -1557,12 +1381,16 @@ int astra_buffer_pool_describe(const astra_buffer_pool *pool, char *out, size_t 
      * One latch hold for every number in the line, so the summary cannot describe a state
      * the pool was never actually in. A diagnostic that mixes two snapshots is worse than
      * one that is a moment stale, because it looks exact.
+     *
+     * `used` is read from the same counter astra_buffer_pool_used_frames reports, rather
+     * than recounted from `in_table` here. A summary that counted the frames differently
+     * to the query would print a number that disagreed with the API by one whenever a
+     * reservation happened to be in flight, which is precisely the moment a caller is
+     * most likely to be looking.
      */
     astra_latch_lock(&mutable_pool->latch);
+    used = mutable_pool->frames.used;
     for (index = 0u; index < mutable_pool->frames.count; ++index) {
-        if (mutable_pool->frames.frames[index].in_table) {
-            ++used;
-        }
         if (mutable_pool->frames.frames[index].is_dirty) {
             ++dirty;
         }

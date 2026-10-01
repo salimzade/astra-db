@@ -42,10 +42,13 @@ endif()
 option(ASTRA_BUILD_TESTS "Build the AstraDB test suite" ON)
 option(ASTRA_WERROR "Treat compiler warnings as errors" ON)
 
+# `thread` stands alone and is not combinable with the other two: AddressSanitizer and
+# ThreadSanitizer use incompatible shadow-memory layouts, so a binary built with both
+# detects neither. Build them in separate directories.
 set(ASTRA_SANITIZE "none" CACHE STRING
-    "Sanitizers to enable: none, address, undefined, address+undefined")
+    "Sanitizers to enable: none, address, undefined, address+undefined, thread")
 set_property(CACHE ASTRA_SANITIZE PROPERTY STRINGS
-    none address undefined address+undefined)
+    none address undefined address+undefined thread)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(Warnings)

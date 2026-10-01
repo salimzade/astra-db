@@ -367,16 +367,6 @@ struct astra_buffer_pool {
 
     /** Total clock sweeps, for diagnostics and for the replacement tests. */
     uint64 replacement_count;
-
-    /**
-     * Threads currently blocked in astra_latch_wait.
-     *
-     * Not needed for correctness - a waiter is woken by a broadcast and re-checks its
-     * predicate - but it lets the tests assert that the pool really does block rather
-     * than spin, and it is the difference between "no thread can proceed" and "no
-     * thread is trying" being distinguishable from the outside.
-     */
-    uint32 waiters;
 };
 
 /*
@@ -460,26 +450,32 @@ void astra_replacer_record_access(astra_buffer_frame *frame);
  *
  * The rule is the clock's: sweep from the hand, and for each frame take it if it is
  * unpinned and unreferenced, clear its reference bit and move on if it is unpinned and
- * referenced, and skip it if it is pinned. A pinned frame's reference bit is left
- * alone, so a page that was pinned across a long scan is still on its second chance
- * afterwards rather than being pushed to the back of the queue by being busy.
+ * referenced, and skip it if it is pinned or its bytes are in motion. A busy frame's
+ * reference bit is left alone, so a page that was pinned across a long scan is still on
+ * its second chance afterwards rather than being pushed to the back of the queue by being
+ * busy.
  *
  * At most two full sweeps, which is what makes a false return trustworthy. The first
- * sweep clears the reference bit of every unpinned frame it passes, so the second sweep
- * is guaranteed to find one if any unpinned frame exists at all. With only one sweep a
- * pool whose frames were all referenced since the last eviction would report "no
- * victim" while holding nothing it was allowed to throw away, and the caller's fetch
- * would fail with an error about pinned frames when none is pinned.
+ * sweep clears the reference bit of every candidate it passes, so the second sweep is
+ * guaranteed to find one if any candidate exists at all. With only one sweep a pool whose
+ * frames were all referenced since the last eviction would report "no victim" while
+ * holding nothing it was allowed to throw away, and the caller's fetch would fail with an
+ * error about pinned frames when none is pinned.
  *
- * The hand advances past the victim and is left where a fruitless sweep ended, which
- * is where it started, so a briefly full pool does not lose its place in the rotation.
+ * The hand advances past the victim and is left where a fruitless sweep ended, which is
+ * where it started, so a briefly full pool does not lose its place in the rotation.
+ *
+ * All three of "may not be evicted" - pinned, loading, being written - are tested here,
+ * not by the caller. That is deliberate: a caller that had to re-check them would have to
+ * loop looking for a second candidate, and a loop is a spin waiting for an invariant
+ * somewhere else to be broken.
  *
  * Parameters:
  *   replacer     - the clock. Not const: the hand is the clock's own state, and hiding
  *                  a mutation behind a const pointer would be a lie about what this
  *                  function does.
- *   frames       - the frames to choose among. Not const, for the same reason: clearing
- *                  a reference bit is the policy's work, not the caller's.
+ *   frames       - the frames to choose among. Not const, for the same reason: clearing a
+ *                  reference bit is the policy's work, not the caller's.
  *   frame_count  - number of frames. Must be at least one.
  *   out_examined - destination for the number of frames looked at, or NULL. Used for
  *                  the pool's sweep counter; not part of the decision.
@@ -492,8 +488,8 @@ void astra_replacer_record_access(astra_buffer_frame *frame);
  *   false when every frame is pinned, which after two complete sweeps is the only
  *   remaining explanation. `*out_frame_index` is then untouched.
  *
- * The caller must hold the pool latch. The replacer calls nothing, so it cannot block
- * and cannot be interrupted between choosing a frame and being told about it.
+ * The caller must hold the pool latch. The replacer calls nothing, so it cannot block and
+ * cannot be interrupted between choosing a frame and being told about it.
  */
 bool astra_replacer_evict(astra_replacer *replacer,
                           astra_buffer_frame *frames,

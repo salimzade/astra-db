@@ -10,12 +10,13 @@ contains the build system, the public API skeleton and the low-level core
 infrastructure that every later subsystem will sit on: a structured error type,
 an allocation abstraction, logging, basic types and process configuration. On
 top of that sits the first piece of real storage, the Disk Manager, which maps
-fixed-size pages onto `<data_dir>/main.db`. No SQL, transactions, WAL, indexing
-or networking exists yet.
+fixed-size pages onto `<data_dir>/main.db`, and above it the Buffer Pool, which
+caches those pages in memory with pinning and clock replacement. No SQL,
+transactions, WAL, indexing or networking exists yet.
 
 ## Current status
 
-Milestone 2 - disk manager.
+Milestone 3 - buffer pool.
 
 | Area | State |
 | --- | --- |
@@ -23,15 +24,17 @@ Milestone 2 - disk manager.
 | Warning policy (GCC/Clang, MSVC), `-Werror` | done |
 | Debug / Release / RelWithDebInfo configurations | done |
 | AddressSanitizer + UndefinedBehaviorSanitizer builds | done |
+| ThreadSanitizer build | GCC/Clang only |
 | Structured errors (`astra_status`, `astra_error`) | done |
 | Allocation abstraction with debug tracking | done |
 | Logging (6 levels, timestamps, subsystems, configurable threshold) | done |
 | Basic types (`uint8`-`int64`, `page_id_t`, `txn_id_t`, `lsn_t`) | done |
 | Process configuration (`astra_config`) | done |
 | Disk Manager (pages, header, checksum, sync, truncate) | done |
-| Unit tests + CTest integration | 39 groups, 11513 checks |
+| Buffer Pool (pinning, clock replacement, write-back, thread safety) | done |
+| Unit tests + CTest integration | 56 groups, 104393 checks |
 | Ownership documentation | [`docs/ownership.md`](docs/ownership.md) |
-| Buffer manager, SQL, transactions, WAL, indexes | not started |
+| SQL, transactions, WAL, indexes | not started |
 
 Layout:
 
@@ -51,7 +54,8 @@ astra-db/
 │   └── storage/             public storage module headers
 │       ├── format.h            on-disk layout, offsets, checksum span
 │       ├── page.h              page buffer lifecycle
-│       └── disk_manager.h      the Disk Manager itself
+│       ├── disk_manager.h      the Disk Manager itself
+│       └── buffer_pool.h       the Buffer Pool, and the pin contract
 ├── src/
 │   ├── main.c              CLI entry point
 │   ├── core/               library internals
@@ -67,6 +71,11 @@ astra-db/
 │       ├── database_file.c    the file, its header, its corruption checks
 │       ├── page_io.c          page buffer validation and lifecycle
 │       ├── disk_manager.c     the public entry points
+│       ├── buffer/            the buffer pool implementation
+│       │   ├── buffer_pool.c    fetch, pin, new page, flush, delete
+│       │   ├── buffer_frame.c   the page table and frame table
+│       │   ├── replacer.c       clock replacement policy
+│       │   └── buffer_internal.h private: frames, latches, internals
 │       ├── storage_internal.h private: byte order, CRC-32, paths, directories
 │       ├── database_file.h    private: file handle abstraction
 │       └── page_io.h          private: page helpers
@@ -350,8 +359,9 @@ its own.
 2. **Memory and error foundation** - errors, allocator, logging, basic types,
    configuration. *(done)*
 3. **Page and file layer** - page abstraction, disk manager, file header,
-   checksums. *(done: the Disk Manager, with no buffering)*
+   checksums. *(done)*
 4. **Buffer manager** - page cache, pinning, replacement, dirty page flushing.
+   *(done: the Buffer Pool, clock replacement, thread safe)*
 5. **WAL** - write-ahead log, log records, flush and recovery protocol.
 6. **Storage engine** - heap tables, tuples, free space management, crash
    recovery driven by the WAL.

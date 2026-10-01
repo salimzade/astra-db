@@ -20,6 +20,7 @@
  *   astra/core/config.h     process configuration
  *   astra/storage/disk_manager.h  page_id_t to bytes on a disk and back
  *   astra/storage/page.h          the in-memory page buffer
+ *   astra/storage/buffer_pool.h   pinned pages in memory, and the clock that evicts them
  *   astra/storage/format.h        the on-disk layout of the primary data file
  *
  * See docs/ownership.md for the rules those headers share.
