@@ -1,11 +1,13 @@
 add_executable(astra_tests
     test_main.c
+    test_temp.c
     test_types.c
     test_error.c
     test_allocator.c
     test_log.c
     test_config.c
     test_disk_manager.c
+    test_buffer_pool.c
 )
 
 target_link_libraries(astra_tests PRIVATE astradb)

@@ -88,6 +88,7 @@ astra_status astra_config_init(astra_config *cfg)
 
     cfg->log_level = ASTRA_CONFIG_DEFAULT_LOG_LEVEL;
     cfg->page_size = ASTRA_PAGE_SIZE_DEFAULT;
+    cfg->buffer_pool_pages = ASTRA_CONFIG_DEFAULT_BUFFER_POOL_PAGES;
 
     return ASTRA_OK;
 }
@@ -110,6 +111,11 @@ astra_status astra_config_validate(const astra_config *cfg)
     }
 
     if (!astra_page_size_is_valid(cfg->page_size)) {
+        return ASTRA_ERR_UNSUPPORTED;
+    }
+
+    if (cfg->buffer_pool_pages < ASTRA_BUFFER_POOL_PAGES_MIN
+        || cfg->buffer_pool_pages > ASTRA_BUFFER_POOL_PAGES_MAX) {
         return ASTRA_ERR_UNSUPPORTED;
     }
 
@@ -162,6 +168,19 @@ astra_status astra_config_set_page_size(astra_config *cfg, uint32 bytes)
     return ASTRA_OK;
 }
 
+astra_status astra_config_set_buffer_pool_pages(astra_config *cfg, uint32 pages)
+{
+    if (cfg == NULL) {
+        return ASTRA_ERR_INVALID_ARGUMENT;
+    }
+    if (pages < ASTRA_BUFFER_POOL_PAGES_MIN || pages > ASTRA_BUFFER_POOL_PAGES_MAX) {
+        return ASTRA_ERR_UNSUPPORTED;
+    }
+
+    cfg->buffer_pool_pages = pages;
+    return ASTRA_OK;
+}
+
 astra_status astra_config_copy(astra_config *dst, const astra_config *src)
 {
     if (dst == NULL || src == NULL) {
@@ -182,8 +201,10 @@ int astra_config_describe(const astra_config *cfg, char *out, size_t out_size)
         return snprintf(out, out_size, "config: unset");
     }
 
-    return snprintf(out, out_size, "data_dir=%s log_level=%s page_size=%lu",
+    return snprintf(out, out_size,
+                     "data_dir=%s log_level=%s page_size=%lu buffer_pool_pages=%lu",
                      cfg->data_dir,
                      astra_log_level_name(cfg->log_level),
-                     (unsigned long)cfg->page_size);
+                     (unsigned long)cfg->page_size,
+                     (unsigned long)cfg->buffer_pool_pages);
 }

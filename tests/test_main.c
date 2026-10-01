@@ -172,6 +172,24 @@ static const astra_test_entry k_tests[] = {
     { "disk_page_sizes",    astra_test_disk_page_sizes },
     { "disk_stress",        astra_test_disk_stress },
 
+    { "buffer_frame_table",  astra_test_buffer_frame_table },
+    { "buffer_page_table",   astra_test_buffer_page_table },
+    { "buffer_retired_set",  astra_test_buffer_retired_set },
+    { "buffer_clock",        astra_test_buffer_clock },
+    { "buffer_config",       astra_test_buffer_config },
+    { "buffer_create",       astra_test_buffer_create },
+    { "buffer_fetch",        astra_test_buffer_fetch },
+    { "buffer_flush",        astra_test_buffer_flush },
+    { "buffer_eviction",     astra_test_buffer_eviction },
+    { "buffer_pinned",       astra_test_buffer_pinned },
+    { "buffer_new_page",     astra_test_buffer_new_page },
+    { "buffer_header_page",  astra_test_buffer_header_page },
+    { "buffer_delete",       astra_test_buffer_delete },
+    { "buffer_queries",      astra_test_buffer_queries },
+    { "buffer_persistence",  astra_test_buffer_persistence },
+    { "buffer_stress",       astra_test_buffer_stress },
+    { "buffer_threads",      astra_test_buffer_threads },
+
     { "lifecycle",     astra_test_lifecycle }
 };
 

@@ -30,6 +30,7 @@
 #include "astra/core/error.h"
 #include "astra/core/log.h"
 #include "astra/core/types.h"
+#include "astra/storage/buffer_pool.h"
 #include "astra/storage/disk_manager.h"
 #include "astra/storage/format.h"
 #include "astra/storage/page.h"

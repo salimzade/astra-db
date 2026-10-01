@@ -180,19 +180,37 @@ static void platform_close(HANDLE handle)
     (void)CloseHandle(handle);
 }
 
+/*
+ * Windows page I/O: the offset goes in the request, never in the handle.
+ *
+ * SetFilePointerEx plus ReadFile/WriteFile with a NULL OVERLAPPED moves the handle's own
+ * file pointer and then uses it, and that pointer is a property of the handle - which one
+ * pool owns and every one of its threads shares. Two threads can therefore interleave
+ * between the seek and the transfer and have one thread's page read from the offset the
+ * other thread chose. It does not corrupt the file; it returns the wrong bytes, or a short
+ * read at the end of the file, and the caller sees a page it never asked for. The symptom is
+ * a data file that is fine when it is closed and nonsense while it is in use, which is a
+ * miserable thing to diagnose.
+ *
+ * Passing an OVERLAPPED with the offset filled in takes the offset out of the handle
+ * entirely: the transfer is positioned by the request, so concurrent calls for different
+ * pages cannot move each other. The handle is opened without FILE_FLAG_OVERLAPPED, so the
+ * calls remain synchronous and a returned OVERLAPPED must not be waited on - the event it
+ * would name is never signalled. This is the same guarantee pread and pwrite give on
+ * POSIX, which is the point: the two platforms have to behave the same way, or the
+ * portability of this file is decorative.
+ */
 static astra_status platform_read(HANDLE handle, uint64 offset, void *dst, uint32 size)
 {
-    LARGE_INTEGER position;
+    OVERLAPPED overlapped;
     DWORD moved = 0;
 
-    position.QuadPart = (LONGLONG)offset;
-
-    if (!SetFilePointerEx(handle, position, NULL, FILE_BEGIN)) {
-        return ASTRA_ERR_IO;
-    }
+    memset(&overlapped, 0, sizeof overlapped);
+    overlapped.Offset = (DWORD)(offset & 0xFFFFFFFFull);
+    overlapped.OffsetHigh = (DWORD)(offset >> 32);
 
     /* A page is at most 64 KiB, comfortably inside a DWORD, so one call suffices. */
-    if (!ReadFile(handle, dst, (DWORD)size, &moved, NULL)) {
+    if (!ReadFile(handle, dst, (DWORD)size, &moved, &overlapped)) {
         return ASTRA_ERR_IO;
     }
     if (moved != (DWORD)size) {
@@ -206,16 +224,15 @@ static astra_status platform_write(HANDLE handle,
                                    const void *src,
                                    uint32 size)
 {
-    LARGE_INTEGER position;
+    OVERLAPPED overlapped;
     DWORD moved = 0;
 
-    position.QuadPart = (LONGLONG)offset;
+    /* The offset rides in the request, for the reason given above platform_read. */
+    memset(&overlapped, 0, sizeof overlapped);
+    overlapped.Offset = (DWORD)(offset & 0xFFFFFFFFull);
+    overlapped.OffsetHigh = (DWORD)(offset >> 32);
 
-    if (!SetFilePointerEx(handle, position, NULL, FILE_BEGIN)) {
-        return ASTRA_ERR_IO;
-    }
-
-    if (!WriteFile(handle, src, (DWORD)size, &moved, NULL)) {
+    if (!WriteFile(handle, src, (DWORD)size, &moved, &overlapped)) {
         return ASTRA_ERR_IO;
     }
     if (moved != (DWORD)size) {

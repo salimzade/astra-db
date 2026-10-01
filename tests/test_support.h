@@ -36,6 +36,21 @@ void astra_test_report_failure(const char *group, int line, const char *expressi
         }                                                                            \
     } while (0)
 
+/**
+ * Records a failed setup step.
+ *
+ * A test that could not get as far as making a temporary directory, or could not build a
+ * config, has failed - but it has not failed an assertion, and `ASTRA_CHECK(!"temp dir")`
+ * is not a way to say so: passing a string where a bool is expected converts a non-null
+ * pointer, always succeeds, and is rejected by the warning set anyway. This records the
+ * step's own description instead, which is what a reader of the output actually wants.
+ */
+#define ASTRA_CHECK_SETUP(what)                                                       \
+    do {                                                                             \
+        ++astra_test_checks;                                                         \
+        astra_test_report_failure(__func__, __LINE__, (what));                       \
+    } while (0)
+
 /** Compares two statuses and reports both symbolically on failure. */
 #define ASTRA_CHECK_STATUS(actual, expected)                                         \
     do {                                                                             \
@@ -150,5 +165,24 @@ void astra_test_disk_invalid_path(void);
 void astra_test_disk_corruption(void);
 void astra_test_disk_page_sizes(void);
 void astra_test_disk_stress(void);
+
+/* The Buffer Pool: the three modules, then the public API, then the properties. */
+void astra_test_buffer_frame_table(void);
+void astra_test_buffer_page_table(void);
+void astra_test_buffer_retired_set(void);
+void astra_test_buffer_clock(void);
+void astra_test_buffer_config(void);
+void astra_test_buffer_create(void);
+void astra_test_buffer_fetch(void);
+void astra_test_buffer_flush(void);
+void astra_test_buffer_eviction(void);
+void astra_test_buffer_pinned(void);
+void astra_test_buffer_new_page(void);
+void astra_test_buffer_header_page(void);
+void astra_test_buffer_delete(void);
+void astra_test_buffer_queries(void);
+void astra_test_buffer_persistence(void);
+void astra_test_buffer_stress(void);
+void astra_test_buffer_threads(void);
 
 #endif /* ASTRA_TESTS_TEST_SUPPORT_H */

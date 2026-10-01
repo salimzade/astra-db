@@ -23,107 +23,24 @@
 
 #include <stdio.h>
 
-#if defined(_WIN32)
-#  include <direct.h>
-#  include <io.h>
-#  include <process.h>
-#  define astra_test_mkdir(path) _mkdir(path)
-#  define astra_test_rmdir(path) _rmdir(path)
-#  define astra_test_getpid() ((long)_getpid())
-#else
-#  include <sys/stat.h>
-#  include <sys/types.h>
-#  include <unistd.h>
-#  define astra_test_mkdir(path) mkdir((path), S_IRWXU)
-#  define astra_test_rmdir(path) rmdir(path)
-#  define astra_test_getpid() ((long)getpid())
-#endif
+#include "test_support.h"
+#include "test_temp.h"
+
+#include "storage/database_file.h"
+#include "storage/storage_internal.h"
+
+#include <stdio.h>
 
 /*
- * ---------------------------------------------------------------------------
- * Temporary database scaffolding
- * ---------------------------------------------------------------------------
- */
-
-/** Distinguishes concurrent groups that would otherwise pick the same name. */
-static unsigned int g_temp_counter;
-
-/*
- * Creates an empty directory for one group's database and writes its path into
- * `out`.
- *
- * Returns false only when the directory could not be made, which the caller turns
- * into a failed check rather than an early return: a test that cannot set up its
- * fixture has failed, and pretending otherwise would hide it.
- */
-static bool make_temp_dir(char *out, size_t out_size)
-{
-    int written;
-
-    written = snprintf(out, out_size, "astra_disk_test_%ld_%u",
-                       astra_test_getpid(), ++g_temp_counter);
-    if (written < 0 || (size_t)written >= out_size) {
-        return false;
-    }
-
-    if (astra_test_mkdir(out) != 0) {
-        return false;
-    }
-    return true;
-}
-
-/* Removes a directory made by make_temp_dir, along with the file inside it. */
-static void remove_temp_dir(const char *dir)
-{
-    char path[ASTRA_STORAGE_PATH_MAX];
-
-    if (astra_path_join(path, sizeof path, dir, ASTRA_DISK_MANAGER_PRIMARY_FILE)
-        == ASTRA_OK) {
-        (void)remove(path);
-    }
-    (void)astra_test_rmdir(dir);
-}
-
-/*
- * Deletes the primary data file but keeps the directory.
- *
- * The corruption group needs to start from a good database several times over, and
- * deleting the file is the only way back to one: creating over an existing database
- * is refused precisely so that an existing database is never overwritten.
+ * The temporary directory fixture, the configuration helper and the primary file path
+ * are shared with the Buffer Pool tests and live in test_temp.c. The corruption helper
+ * stays here, because only the Disk Manager tests need it: it exists to get back to a
+ * good database without going through the library, which is what a test that
+ * deliberately corrupts a file needs and nothing else does.
  */
 static void remove_primary_file(const char *dir)
 {
-    char path[ASTRA_STORAGE_PATH_MAX];
-
-    if (astra_path_join(path, sizeof path, dir, ASTRA_DISK_MANAGER_PRIMARY_FILE)
-        == ASTRA_OK) {
-        (void)remove(path);
-    }
-}
-
-/* Fills `cfg` with the settings one temporary database is opened with. */
-static astra_status make_config(astra_config *cfg, const char *dir, uint32 page_size)
-{
-    astra_status status;
-
-    status = astra_config_init(cfg);
-    if (status != ASTRA_OK) {
-        return status;
-    }
-
-    status = astra_config_set_data_dir(cfg, dir);
-    if (status != ASTRA_OK) {
-        return status;
-    }
-
-    return astra_config_set_page_size(cfg, page_size);
-}
-
-/* Returns the path of the primary data file inside `dir`. */
-static bool primary_path(char *out, size_t out_size, const char *dir)
-{
-    return astra_path_join(out, out_size, dir, ASTRA_DISK_MANAGER_PRIMARY_FILE)
-           == ASTRA_OK;
+    astra_test_remove_primary_file(dir);
 }
 
 /*
@@ -138,7 +55,7 @@ static bool poke_file(const char *dir,
     char path[ASTRA_STORAGE_PATH_MAX];
     FILE *stream;
 
-    if (!primary_path(path, sizeof path, dir)) {
+    if (!astra_test_primary_path(path, sizeof path, dir)) {
         return false;
     }
 
@@ -167,7 +84,7 @@ static bool peek_file(const char *dir, long offset, void *out, size_t length)
     char path[ASTRA_STORAGE_PATH_MAX];
     FILE *stream;
 
-    if (!primary_path(path, sizeof path, dir)) {
+    if (!astra_test_primary_path(path, sizeof path, dir)) {
         return false;
     }
 
@@ -440,13 +357,13 @@ void astra_test_disk_create(void)
 
     astra_test_begin("astra_test_disk_create");
 
-    if (!make_temp_dir(dir, sizeof dir)) {
+    if (!astra_test_make_temp_dir(dir, sizeof dir)) {
         ASTRA_CHECK(false);
         return;
     }
 
     /* The directory does not exist yet, and creating a database makes it. */
-    ASTRA_CHECK_STATUS(make_config(&config, dir, ASTRA_PAGE_SIZE_DEFAULT), ASTRA_OK);
+    ASTRA_CHECK_STATUS(astra_test_make_config(&config, dir, ASTRA_PAGE_SIZE_DEFAULT), ASTRA_OK);
     ASTRA_CHECK_STATUS(astra_disk_manager_create(&config, &manager), ASTRA_OK);
     ASTRA_CHECK(manager != NULL);
 
@@ -469,7 +386,7 @@ void astra_test_disk_create(void)
         FILE *stream;
         long length = -1;
 
-        ASTRA_CHECK(primary_path(path, sizeof path, dir));
+        ASTRA_CHECK(astra_test_primary_path(path, sizeof path, dir));
         ASTRA_CHECK_STRING(path + strlen(path) - (sizeof(ASTRA_DISK_MANAGER_PRIMARY_FILE) - 1u),
                            ASTRA_DISK_MANAGER_PRIMARY_FILE);
 
@@ -486,7 +403,7 @@ void astra_test_disk_create(void)
     /* Creating over an existing database is refused, never done silently. */
     {
         astra_disk_manager *second = NULL;
-        ASTRA_CHECK_STATUS(make_config(&config, dir, ASTRA_PAGE_SIZE_DEFAULT), ASTRA_OK);
+        ASTRA_CHECK_STATUS(astra_test_make_config(&config, dir, ASTRA_PAGE_SIZE_DEFAULT), ASTRA_OK);
         ASTRA_CHECK_STATUS(astra_disk_manager_create(&config, &second),
                            ASTRA_ERR_ALREADY_EXISTS);
         ASTRA_CHECK(second == NULL);
@@ -504,7 +421,7 @@ void astra_test_disk_create(void)
         ASTRA_CHECK_STRING(path, "data/main.db");
     }
 
-    remove_temp_dir(dir);
+    astra_test_remove_temp_dir(dir);
 }
 
 /*
@@ -522,12 +439,12 @@ void astra_test_disk_open(void)
 
     astra_test_begin("astra_test_disk_open");
 
-    if (!make_temp_dir(dir, sizeof dir)) {
+    if (!astra_test_make_temp_dir(dir, sizeof dir)) {
         ASTRA_CHECK(false);
         return;
     }
 
-    ASTRA_CHECK_STATUS(make_config(&config, dir, ASTRA_PAGE_SIZE_DEFAULT), ASTRA_OK);
+    ASTRA_CHECK_STATUS(astra_test_make_config(&config, dir, ASTRA_PAGE_SIZE_DEFAULT), ASTRA_OK);
     ASTRA_CHECK_STATUS(astra_disk_manager_create(&config, &manager), ASTRA_OK);
     ASTRA_CHECK_STATUS(astra_disk_manager_close(manager), ASTRA_OK);
 
@@ -550,7 +467,7 @@ void astra_test_disk_open(void)
         astra_config absent_config;
 
         (void)snprintf(missing, sizeof missing, "%s_absent", dir);
-        ASTRA_CHECK_STATUS(make_config(&absent_config, missing,
+        ASTRA_CHECK_STATUS(astra_test_make_config(&absent_config, missing,
                                        ASTRA_PAGE_SIZE_DEFAULT), ASTRA_OK);
         ASTRA_CHECK_STATUS(astra_disk_manager_open(&absent_config, &absent),
                            ASTRA_ERR_NOT_FOUND);
@@ -566,7 +483,7 @@ void astra_test_disk_open(void)
 
         (void)snprintf(empty, sizeof empty, "%s_empty", dir);
         ASTRA_CHECK(astra_test_mkdir(empty) == 0);
-        ASTRA_CHECK_STATUS(make_config(&empty_config, empty,
+        ASTRA_CHECK_STATUS(astra_test_make_config(&empty_config, empty,
                                        ASTRA_PAGE_SIZE_DEFAULT), ASTRA_OK);
         ASTRA_CHECK_STATUS(astra_disk_manager_open(&empty_config, &absent),
                            ASTRA_ERR_NOT_FOUND);
@@ -574,7 +491,7 @@ void astra_test_disk_open(void)
         (void)astra_test_rmdir(empty);
     }
 
-    remove_temp_dir(dir);
+    astra_test_remove_temp_dir(dir);
 }
 
 /*
@@ -596,15 +513,15 @@ void astra_test_disk_roundtrip(void)
 
     astra_test_begin("astra_test_disk_roundtrip");
 
-    if (!make_temp_dir(dir, sizeof dir)) {
+    if (!astra_test_make_temp_dir(dir, sizeof dir)) {
         ASTRA_CHECK(false);
         return;
     }
 
-    ASTRA_CHECK_STATUS(make_config(&config, dir, ASTRA_PAGE_SIZE_DEFAULT), ASTRA_OK);
+    ASTRA_CHECK_STATUS(astra_test_make_config(&config, dir, ASTRA_PAGE_SIZE_DEFAULT), ASTRA_OK);
     ASTRA_CHECK_STATUS(astra_disk_manager_create(&config, &manager), ASTRA_OK);
     if (manager == NULL) {
-        remove_temp_dir(dir);
+        astra_test_remove_temp_dir(dir);
         return;
     }
 
@@ -667,7 +584,7 @@ void astra_test_disk_roundtrip(void)
         manager = NULL;
     }
 
-    remove_temp_dir(dir);
+    astra_test_remove_temp_dir(dir);
 }
 
 /*
@@ -689,15 +606,15 @@ void astra_test_disk_alloc_many(void)
 
     astra_test_begin("astra_test_disk_alloc_many");
 
-    if (!make_temp_dir(dir, sizeof dir)) {
+    if (!astra_test_make_temp_dir(dir, sizeof dir)) {
         ASTRA_CHECK(false);
         return;
     }
 
-    ASTRA_CHECK_STATUS(make_config(&config, dir, 4096u), ASTRA_OK);
+    ASTRA_CHECK_STATUS(astra_test_make_config(&config, dir, 4096u), ASTRA_OK);
     ASTRA_CHECK_STATUS(astra_disk_manager_create(&config, &manager), ASTRA_OK);
     if (manager == NULL) {
-        remove_temp_dir(dir);
+        astra_test_remove_temp_dir(dir);
         return;
     }
 
@@ -753,7 +670,7 @@ void astra_test_disk_alloc_many(void)
         manager = NULL;
     }
 
-    remove_temp_dir(dir);
+    astra_test_remove_temp_dir(dir);
 }
 
 /*
@@ -774,15 +691,15 @@ void astra_test_disk_sync(void)
 
     astra_test_begin("astra_test_disk_sync");
 
-    if (!make_temp_dir(dir, sizeof dir)) {
+    if (!astra_test_make_temp_dir(dir, sizeof dir)) {
         ASTRA_CHECK(false);
         return;
     }
 
-    ASTRA_CHECK_STATUS(make_config(&config, dir, 4096u), ASTRA_OK);
+    ASTRA_CHECK_STATUS(astra_test_make_config(&config, dir, 4096u), ASTRA_OK);
     ASTRA_CHECK_STATUS(astra_disk_manager_create(&config, &manager), ASTRA_OK);
     if (manager == NULL) {
-        remove_temp_dir(dir);
+        astra_test_remove_temp_dir(dir);
         return;
     }
 
@@ -819,7 +736,7 @@ void astra_test_disk_sync(void)
     ASTRA_CHECK_STATUS(astra_disk_manager_close(NULL), ASTRA_OK);
 
     astra_page_release(&page);
-    remove_temp_dir(dir);
+    astra_test_remove_temp_dir(dir);
 }
 
 /*
@@ -841,15 +758,15 @@ void astra_test_disk_truncate(void)
 
     astra_test_begin("astra_test_disk_truncate");
 
-    if (!make_temp_dir(dir, sizeof dir)) {
+    if (!astra_test_make_temp_dir(dir, sizeof dir)) {
         ASTRA_CHECK(false);
         return;
     }
 
-    ASTRA_CHECK_STATUS(make_config(&config, dir, 4096u), ASTRA_OK);
+    ASTRA_CHECK_STATUS(astra_test_make_config(&config, dir, 4096u), ASTRA_OK);
     ASTRA_CHECK_STATUS(astra_disk_manager_create(&config, &manager), ASTRA_OK);
     if (manager == NULL) {
-        remove_temp_dir(dir);
+        astra_test_remove_temp_dir(dir);
         return;
     }
 
@@ -922,7 +839,7 @@ void astra_test_disk_truncate(void)
         manager = NULL;
     }
 
-    remove_temp_dir(dir);
+    astra_test_remove_temp_dir(dir);
 }
 
 /*
@@ -944,15 +861,15 @@ void astra_test_disk_invalid_page(void)
 
     astra_test_begin("astra_test_disk_invalid_page");
 
-    if (!make_temp_dir(dir, sizeof dir)) {
+    if (!astra_test_make_temp_dir(dir, sizeof dir)) {
         ASTRA_CHECK(false);
         return;
     }
 
-    ASTRA_CHECK_STATUS(make_config(&config, dir, 4096u), ASTRA_OK);
+    ASTRA_CHECK_STATUS(astra_test_make_config(&config, dir, 4096u), ASTRA_OK);
     ASTRA_CHECK_STATUS(astra_disk_manager_create(&config, &manager), ASTRA_OK);
     if (manager == NULL) {
-        remove_temp_dir(dir);
+        astra_test_remove_temp_dir(dir);
         return;
     }
 
@@ -1060,7 +977,7 @@ void astra_test_disk_invalid_page(void)
     ASTRA_CHECK_STATUS(astra_disk_manager_close(manager), ASTRA_OK);
     manager = NULL;
 
-    remove_temp_dir(dir);
+    astra_test_remove_temp_dir(dir);
 }
 
 /*
@@ -1081,7 +998,7 @@ void astra_test_disk_invalid_path(void)
 
     astra_test_begin("astra_test_disk_invalid_path");
 
-    if (!make_temp_dir(dir, sizeof dir)) {
+    if (!astra_test_make_temp_dir(dir, sizeof dir)) {
         ASTRA_CHECK(false);
         return;
     }
@@ -1091,7 +1008,7 @@ void astra_test_disk_invalid_path(void)
                        ASTRA_ERR_INVALID_ARGUMENT);
     ASTRA_CHECK_STATUS(astra_disk_manager_open(NULL, &manager),
                        ASTRA_ERR_INVALID_ARGUMENT);
-    ASTRA_CHECK_STATUS(make_config(&config, dir, ASTRA_PAGE_SIZE_DEFAULT), ASTRA_OK);
+    ASTRA_CHECK_STATUS(astra_test_make_config(&config, dir, ASTRA_PAGE_SIZE_DEFAULT), ASTRA_OK);
     ASTRA_CHECK_STATUS(astra_disk_manager_create(&config, NULL),
                        ASTRA_ERR_INVALID_ARGUMENT);
     ASTRA_CHECK_STATUS(astra_disk_manager_open(&config, NULL),
@@ -1234,12 +1151,12 @@ void astra_test_disk_invalid_path(void)
 
     /* A perfectly ordinary database still works after all of that, so the
      * rejections above are not rejections of everything. */
-    ASTRA_CHECK_STATUS(make_config(&config, dir, ASTRA_PAGE_SIZE_DEFAULT), ASTRA_OK);
+    ASTRA_CHECK_STATUS(astra_test_make_config(&config, dir, ASTRA_PAGE_SIZE_DEFAULT), ASTRA_OK);
     ASTRA_CHECK_STATUS(astra_disk_manager_create(&config, &manager), ASTRA_OK);
     ASTRA_CHECK_STATUS(astra_disk_manager_close(manager), ASTRA_OK);
     manager = NULL;
 
-    remove_temp_dir(dir);
+    astra_test_remove_temp_dir(dir);
 }
 
 /*
@@ -1258,12 +1175,12 @@ void astra_test_disk_corruption(void)
 
     astra_test_begin("astra_test_disk_corruption");
 
-    if (!make_temp_dir(dir, sizeof dir)) {
+    if (!astra_test_make_temp_dir(dir, sizeof dir)) {
         ASTRA_CHECK(false);
         return;
     }
 
-    ASTRA_CHECK_STATUS(make_config(&config, dir, 4096u), ASTRA_OK);
+    ASTRA_CHECK_STATUS(astra_test_make_config(&config, dir, 4096u), ASTRA_OK);
     ASTRA_CHECK_STATUS(astra_disk_manager_create(&config, &manager), ASTRA_OK);
     ASTRA_CHECK_STATUS(astra_disk_manager_close(manager), ASTRA_OK);
     manager = NULL;
@@ -1331,12 +1248,12 @@ void astra_test_disk_corruption(void)
         astra_config foreign_config;
         char foreign_path[ASTRA_STORAGE_PATH_MAX];
 
-        if (!make_temp_dir(foreign, sizeof foreign)) {
+        if (!astra_test_make_temp_dir(foreign, sizeof foreign)) {
             ASTRA_CHECK(false);
         } else {
             FILE *stream;
 
-            ASTRA_CHECK(primary_path(foreign_path, sizeof foreign_path, foreign));
+            ASTRA_CHECK(astra_test_primary_path(foreign_path, sizeof foreign_path, foreign));
             stream = fopen(foreign_path, "wb");
             ASTRA_CHECK(stream != NULL);
             if (stream != NULL) {
@@ -1344,12 +1261,12 @@ void astra_test_disk_corruption(void)
                 ASTRA_CHECK(fwrite(noise, 1u, sizeof noise, stream) == sizeof noise);
                 (void)fclose(stream);
             }
-            ASTRA_CHECK_STATUS(make_config(&foreign_config, foreign, 4096u),
+            ASTRA_CHECK_STATUS(astra_test_make_config(&foreign_config, foreign, 4096u),
                                ASTRA_OK);
             ASTRA_CHECK_STATUS(astra_disk_manager_open(&foreign_config, &absent),
                                ASTRA_ERR_CORRUPTION);
             ASTRA_CHECK(absent == NULL);
-            remove_temp_dir(foreign);
+            astra_test_remove_temp_dir(foreign);
         }
     }
 
@@ -1362,10 +1279,10 @@ void astra_test_disk_corruption(void)
         char partial_path[ASTRA_STORAGE_PATH_MAX];
         FILE *stream;
 
-        if (!make_temp_dir(partial, sizeof partial)) {
+        if (!astra_test_make_temp_dir(partial, sizeof partial)) {
             ASTRA_CHECK(false);
         } else {
-            ASTRA_CHECK(primary_path(partial_path, sizeof partial_path, partial));
+            ASTRA_CHECK(astra_test_primary_path(partial_path, sizeof partial_path, partial));
             stream = fopen(partial_path, "wb");
             ASTRA_CHECK(stream != NULL);
             if (stream != NULL) {
@@ -1374,7 +1291,7 @@ void astra_test_disk_corruption(void)
                 ASTRA_CHECK(fwrite(body, 1u, sizeof body, stream) == sizeof body);
                 (void)fclose(stream);
             }
-            ASTRA_CHECK_STATUS(make_config(&partial_config, partial, 4096u),
+            ASTRA_CHECK_STATUS(astra_test_make_config(&partial_config, partial, 4096u),
                                ASTRA_OK);
             ASTRA_CHECK_STATUS(astra_disk_manager_open(&partial_config, &absent),
                                ASTRA_ERR_CORRUPTION);
@@ -1390,7 +1307,7 @@ void astra_test_disk_corruption(void)
                                ASTRA_ERR_CORRUPTION);
             ASTRA_CHECK(absent == NULL);
 
-            remove_temp_dir(partial);
+            astra_test_remove_temp_dir(partial);
         }
     }
 
@@ -1401,12 +1318,12 @@ void astra_test_disk_corruption(void)
         astra_config mismatched;
 
         remove_primary_file(dir);
-        ASTRA_CHECK_STATUS(make_config(&config, dir, 4096u), ASTRA_OK);
+        ASTRA_CHECK_STATUS(astra_test_make_config(&config, dir, 4096u), ASTRA_OK);
         ASTRA_CHECK_STATUS(astra_disk_manager_create(&config, &manager), ASTRA_OK);
         ASTRA_CHECK_STATUS(astra_disk_manager_close(manager), ASTRA_OK);
         manager = NULL;
 
-        ASTRA_CHECK_STATUS(make_config(&mismatched, dir, 8192u), ASTRA_OK);
+        ASTRA_CHECK_STATUS(astra_test_make_config(&mismatched, dir, 8192u), ASTRA_OK);
         ASTRA_CHECK_STATUS(astra_disk_manager_open(&mismatched, &manager),
                            ASTRA_ERR_CORRUPTION);
         ASTRA_CHECK(manager == NULL);
@@ -1418,7 +1335,7 @@ void astra_test_disk_corruption(void)
         astra_config same;
         uint8 version[4];
 
-        ASTRA_CHECK_STATUS(make_config(&same, dir, 4096u), ASTRA_OK);
+        ASTRA_CHECK_STATUS(astra_test_make_config(&same, dir, 4096u), ASTRA_OK);
         ASTRA_CHECK_STATUS(astra_disk_manager_open(&same, &manager), ASTRA_OK);
         ASTRA_CHECK_STATUS(astra_disk_manager_close(manager), ASTRA_OK);
         manager = NULL;
@@ -1437,7 +1354,7 @@ void astra_test_disk_corruption(void)
         ASTRA_CHECK(manager == NULL);
     }
 
-    remove_temp_dir(dir);
+    astra_test_remove_temp_dir(dir);
 }
 
 /*
@@ -1465,12 +1382,12 @@ void astra_test_disk_page_sizes(void)
         uint64 bytes = 0;
         uint64 pages = 0;
 
-        if (!make_temp_dir(dir, sizeof dir)) {
+        if (!astra_test_make_temp_dir(dir, sizeof dir)) {
             ASTRA_CHECK(false);
             continue;
         }
 
-        ASTRA_CHECK_STATUS(make_config(&config, dir, sizes[index]), ASTRA_OK);
+        ASTRA_CHECK_STATUS(astra_test_make_config(&config, dir, sizes[index]), ASTRA_OK);
         ASTRA_CHECK_STATUS(astra_disk_manager_create(&config, &manager), ASTRA_OK);
         if (manager != NULL) {
             ASTRA_CHECK_UINT64(astra_disk_manager_page_size(manager), sizes[index]);
@@ -1510,7 +1427,7 @@ void astra_test_disk_page_sizes(void)
             ASTRA_CHECK_STATUS(astra_disk_manager_close(manager), ASTRA_OK);
         }
 
-        remove_temp_dir(dir);
+        astra_test_remove_temp_dir(dir);
     }
 }
 
@@ -1538,15 +1455,15 @@ void astra_test_disk_stress(void)
 
     astra_test_begin("astra_test_disk_stress");
 
-    if (!make_temp_dir(dir, sizeof dir)) {
+    if (!astra_test_make_temp_dir(dir, sizeof dir)) {
         ASTRA_CHECK(false);
         return;
     }
 
-    ASTRA_CHECK_STATUS(make_config(&config, dir, ASTRA_PAGE_SIZE_DEFAULT), ASTRA_OK);
+    ASTRA_CHECK_STATUS(astra_test_make_config(&config, dir, ASTRA_PAGE_SIZE_DEFAULT), ASTRA_OK);
     ASTRA_CHECK_STATUS(astra_disk_manager_create(&config, &manager), ASTRA_OK);
     if (manager == NULL) {
-        remove_temp_dir(dir);
+        astra_test_remove_temp_dir(dir);
         return;
     }
 
@@ -1637,5 +1554,5 @@ void astra_test_disk_stress(void)
         manager = NULL;
     }
 
-    remove_temp_dir(dir);
+    astra_test_remove_temp_dir(dir);
 }
